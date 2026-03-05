@@ -38,7 +38,7 @@ def _patch_startup_data(monkeypatch: pytest.MonkeyPatch) -> None:
     """Patch module-level state so tests don't hit the network."""
     import axle_mcp_server.server as srv
 
-    default_env = MOCK_ENVIRONMENTS[-1]["name"]
+    default_env = srv._default_environment(MOCK_ENVIRONMENTS)
     monkeypatch.setattr(srv, "ENDPOINTS", MOCK_ENDPOINTS)
     monkeypatch.setattr(srv, "ENVIRONMENTS", MOCK_ENVIRONMENTS)
     monkeypatch.setattr(srv, "DEFAULT_ENVIRONMENT", default_env)

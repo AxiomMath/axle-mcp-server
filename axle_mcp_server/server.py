@@ -9,6 +9,7 @@ import importlib.metadata
 import json
 import logging
 import os
+import re
 import urllib.request
 from typing import Any, Final, TypedDict
 
@@ -143,9 +144,26 @@ def _build_tool_defs(endpoints: dict[str, Any], default_environment: str) -> lis
     return tools
 
 
+def _default_environment(environments: list[dict[str, Any]]) -> str:
+    """Select the latest lean-4.{minor}.{micro} environment by version."""
+    pattern = re.compile(r"^lean-4\.(\d+)\.(\d+)$")
+    best_name: str | None = None
+    best_version: tuple[int, int] = (-1, -1)
+    for env in environments:
+        m = pattern.match(env["name"])
+        if m:
+            version = (int(m.group(1)), int(m.group(2)))
+            if version > best_version:
+                best_version = version
+                best_name = env["name"]
+    if best_name is None:
+        return environments[-1]["name"]
+    return best_name
+
+
 ENDPOINTS: Final[dict[str, Any]] = _fetch_json("/v1/endpoints")
 ENVIRONMENTS: Final[list[dict[str, Any]]] = _fetch_json("/v1/environments")
-DEFAULT_ENVIRONMENT: Final[str] = ENVIRONMENTS[-1]["name"]
+DEFAULT_ENVIRONMENT: Final[str] = _default_environment(ENVIRONMENTS)
 TOOL_DEFS: Final[list[types.Tool]] = _build_tool_defs(ENDPOINTS, DEFAULT_ENVIRONMENT)
 ENDPOINT_NAMES: Final[set[str]] = {t.name for t in TOOL_DEFS} - {"list_environments"}
 
