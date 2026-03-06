@@ -5,8 +5,10 @@ Protocol](https://modelcontextprotocol.io/docs/getting-started/intro) server for
 [Axiom Lean Engine](https://axle.axiommath.ai) — exposes Lean verification and
 manipulation tools to AI agents.
 
+![](demo.gif)
 
-## Setup
+
+## Installation
 
 1. Create a free API key:
    [https://axle.axiommath.ai/app/console](https://axle.axiommath.ai/app/console).
@@ -37,17 +39,3 @@ with the API key you created in step 1:
   }
 }
 ```
-
-
-## Usage
-
-With the MCP server installed, agents can check and fix Lean code directly:
-
-> **You:** Can you check if this proof compiles?
->
-> ```lean
-> theorem add_comm (a b : Nat) : a + b = b + a := by
->   ring
-> ```
-
-Ask your agent what AXLE MCP can do.
