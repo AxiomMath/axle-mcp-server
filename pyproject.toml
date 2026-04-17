@@ -13,6 +13,13 @@ dependencies = [
     "mcp>=1.2.0",
 ]
 
+[project.optional-dependencies]
+http = [
+    "mcp>=1.20.0",
+    "starlette>=0.40",
+    "uvicorn>=0.30",
+]
+
 [project.scripts]
 axle-mcp-server = "axle_mcp_server.server:main"
 
