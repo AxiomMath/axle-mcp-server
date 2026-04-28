@@ -4,7 +4,9 @@ Copyright (c) 2026 Axiom Math. MIT License.
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
+import contextvars
 import importlib.metadata
 import json
 import logging
@@ -22,6 +24,15 @@ logger = logging.getLogger(__name__)
 VERSION: Final[str] = importlib.metadata.version("axiom-axle-mcp")
 AXLE_API_URL: Final[str] = os.environ.get("AXLE_API_URL", "https://axle.axiommath.ai")
 AXLE_API_KEY: Final[str | None] = os.environ.get("AXLE_API_KEY")
+
+# Populated per HTTP request by the streamable-HTTP wrapper. Unused in stdio mode,
+# where authentication comes from the AXLE_API_KEY env var instead.
+_request_authorization: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "axle_request_authorization", default=None
+)
+_request_client_ip: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "axle_request_client_ip", default=None
+)
 
 TYPE_MAP: Final[dict[str, dict[str, Any]]] = {
     "text": {"type": "string"},
@@ -45,8 +56,17 @@ class InputField(TypedDict, total=False):
 
 def _headers() -> dict[str, str]:
     h: dict[str, str] = {"X-Request-Source": f"axiom-axle-mcp/{VERSION}"}
-    if AXLE_API_KEY:
-        h["Authorization"] = f"Bearer {AXLE_API_KEY}"
+    # Per-request auth (HTTP mode) wins over the stdio env-var fallback.
+    auth = _request_authorization.get()
+    if auth is None and AXLE_API_KEY:
+        auth = f"Bearer {AXLE_API_KEY}"
+    if auth:
+        h["Authorization"] = auth
+    client_ip = _request_client_ip.get()
+    if client_ip:
+        # AXLE may use this to attribute anonymous requests to end-user IPs
+        # when our Cloud Run egress is on its trusted-proxy list.
+        h["X-Forwarded-For"] = client_ip
     return h
 
 
@@ -198,7 +218,7 @@ async def handle_call_tool(
     return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
 
 
-async def _amain() -> None:
+async def _stdio_main() -> None:
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,
@@ -207,8 +227,112 @@ async def _amain() -> None:
         )
 
 
+def _extract_request_context(scope: Any) -> tuple[str | None, str | None]:
+    """Pull Authorization + first X-Forwarded-For hop from an ASGI scope."""
+    authorization: str | None = None
+    client_ip: str | None = None
+    for name, value in scope.get("headers", []):
+        lname = name.decode("latin-1").lower()
+        if lname == "authorization":
+            authorization = value.decode("latin-1")
+        elif lname == "x-forwarded-for" and client_ip is None:
+            client_ip = value.decode("latin-1").split(",", 1)[0].strip() or None
+    if client_ip is None:
+        client = scope.get("client")
+        if client:
+            client_ip = client[0]
+    return authorization, client_ip
+
+
+def _build_http_app() -> Any:
+    """Construct the Starlette ASGI app that serves MCP over streamable HTTP."""
+    from contextlib import asynccontextmanager
+
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+    from starlette.applications import Starlette
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+
+    session_manager = StreamableHTTPSessionManager(
+        app=server,
+        event_store=None,
+        stateless=True,
+    )
+
+    async def handle_mcp(scope: Any, receive: Any, send: Any) -> None:
+        authorization, client_ip = _extract_request_context(scope)
+        auth_token = _request_authorization.set(authorization)
+        ip_token = _request_client_ip.set(client_ip)
+        try:
+            await session_manager.handle_request(scope, receive, send)
+        finally:
+            _request_authorization.reset(auth_token)
+            _request_client_ip.reset(ip_token)
+
+    async def health(_request: Request) -> JSONResponse:
+        return JSONResponse(
+            {
+                "service": "axle-mcp-server",
+                "version": VERSION,
+                "upstream": AXLE_API_URL,
+                "mcp_endpoint": "/mcp",
+            }
+        )
+
+    @asynccontextmanager
+    async def lifespan(_app: Starlette) -> Any:
+        async with session_manager.run():
+            yield
+
+    starlette_app = Starlette(
+        routes=[Route("/", health, methods=["GET"])],
+        lifespan=lifespan,
+    )
+
+    # ASGI wrapper: route /mcp (with or without trailing slash) straight to the
+    # MCP handler. Skipping Starlette's Mount avoids a 307 redirect on /mcp
+    # that Claude's web connector doesn't follow on POST.
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") == "http" and scope.get("path") in ("/mcp", "/mcp/"):
+            await handle_mcp(scope, receive, send)
+            return
+        await starlette_app(scope, receive, send)
+
+    return app
+
+
+def _http_main(host: str, port: int) -> None:
+    import uvicorn
+
+    app = _build_http_app()
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
 def main() -> None:
-    asyncio.run(_amain())
+    parser = argparse.ArgumentParser(prog="axle-mcp-server")
+    parser.add_argument(
+        "--http",
+        action="store_true",
+        help="Serve MCP over streamable HTTP instead of stdio (for hosted deployments).",
+    )
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="HTTP bind address (default: 0.0.0.0). Ignored in stdio mode.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("PORT", "8080")),
+        help="HTTP port (default: $PORT or 8080). Ignored in stdio mode.",
+    )
+    args = parser.parse_args()
+
+    if args.http:
+        _http_main(args.host, args.port)
+    else:
+        asyncio.run(_stdio_main())
 
 
 if __name__ == "__main__":
