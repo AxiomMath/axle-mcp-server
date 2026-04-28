@@ -57,15 +57,3 @@ this once; after setup, Axle is available in every future conversation.
 7. In any chat, open the tools menu (the **+** or paperclip icon in the
    composer) → **Connectors** → toggle **Axle** on. You should see the Axle
    tools listed.
-
-### ChatGPT (web / mobile)
-
-Custom MCP connectors require a paid plan (Plus, Pro, Business, or Enterprise).
-
-1. Open ChatGPT → **Settings** → **Connectors**.
-2. Click **Add** (or **Create**) and choose the custom / MCP option.
-3. Fill in:
-   - **Name:** `Axle`
-   - **MCP server URL:** `https://mcp.axiommath.ai/mcp`
-   - **Authentication:** paste the API key from step 1 as the bearer token.
-4. Save, then enable Axle in your chat's tools menu.
