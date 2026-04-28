@@ -252,7 +252,7 @@ def _build_http_app() -> Any:
     from starlette.applications import Starlette
     from starlette.requests import Request
     from starlette.responses import JSONResponse
-    from starlette.routing import Mount, Route
+    from starlette.routing import Route
 
     session_manager = StreamableHTTPSessionManager(
         app=server,
@@ -285,13 +285,21 @@ def _build_http_app() -> Any:
         async with session_manager.run():
             yield
 
-    return Starlette(
-        routes=[
-            Route("/", health, methods=["GET"]),
-            Mount("/mcp", app=handle_mcp),
-        ],
+    starlette_app = Starlette(
+        routes=[Route("/", health, methods=["GET"])],
         lifespan=lifespan,
     )
+
+    # ASGI wrapper: route /mcp (with or without trailing slash) straight to the
+    # MCP handler. Skipping Starlette's Mount avoids a 307 redirect on /mcp
+    # that Claude's web connector doesn't follow on POST.
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") == "http" and scope.get("path") in ("/mcp", "/mcp/"):
+            await handle_mcp(scope, receive, send)
+            return
+        await starlette_app(scope, receive, send)
+
+    return app
 
 
 def _http_main(host: str, port: int) -> None:
