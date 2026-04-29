@@ -88,3 +88,50 @@ async def test_share_url_looks_up_tool_name_when_omitted() -> None:
 async def test_share_url_rejects_missing_request_id() -> None:
     with pytest.raises(ValueError, match="request_id"):
         await handle_call_tool("share_url", {})
+
+
+async def test_read_share_url_extracts_uuid_from_full_url() -> None:
+    uuid = "12345678-1234-1234-1234-123456789abc"
+    get_mock = AsyncMock(
+        return_value={
+            "request_id": uuid,
+            "tool_name": "verify_proof",
+            "inputs": {"content": "x"},
+            "result": {"okay": True},
+            "state": "succeeded",
+            "created_at": "T",
+            "tier_saved": "alpha",
+            "source": "hot_store",
+        }
+    )
+    with patch("axle_mcp_server.server._get_shared_link", get_mock):
+        result = await handle_call_tool(
+            "read_share_url",
+            {"share_url": f"https://axle.axiommath.ai/verify_proof#r={uuid}"},
+        )
+
+    get_mock.assert_called_once_with(uuid)
+    parsed = json.loads(result[0].text)
+    assert parsed["tool_name"] == "verify_proof"
+    assert parsed["state"] == "succeeded"
+    assert "tier_saved" not in parsed
+    assert "source" not in parsed
+
+
+async def test_read_share_url_accepts_bare_uuid() -> None:
+    uuid = "12345678-1234-1234-1234-123456789abc"
+    get_mock = AsyncMock(return_value={"request_id": uuid, "tool_name": "check"})
+    with patch("axle_mcp_server.server._get_shared_link", get_mock):
+        await handle_call_tool("read_share_url", {"share_url": uuid})
+
+    get_mock.assert_called_once_with(uuid)
+
+
+async def test_read_share_url_rejects_input_without_uuid() -> None:
+    with pytest.raises(ValueError, match="UUID"):
+        await handle_call_tool("read_share_url", {"share_url": "not-a-uuid"})
+
+
+async def test_read_share_url_rejects_missing_input() -> None:
+    with pytest.raises(ValueError, match="share_url"):
+        await handle_call_tool("read_share_url", {})

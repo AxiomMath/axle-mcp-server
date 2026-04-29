@@ -240,6 +240,30 @@ def _build_tool_defs(endpoints: dict[str, Any], default_environment: str) -> lis
             },
         )
     )
+    tools.append(
+        types.Tool(
+            name="read_share_url",
+            description=(
+                "Fetch the inputs and result of a previously shared AXLE verification. "
+                "Call this when the user gives you a share URL (or bare request_id) and "
+                "asks what it contains. Accepts either a full webapp URL like "
+                "'https://axle.axiommath.ai/verify_proof#r=<uuid>' or just the UUID. "
+                "Returns {request_id, tool_name, inputs, result, state, created_at}."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "share_url": {
+                        "type": "string",
+                        "description": (
+                            "A share URL produced by share_url, or a bare request_id UUID."
+                        ),
+                    },
+                },
+                "required": ["share_url"],
+            },
+        )
+    )
     return tools
 
 
@@ -265,8 +289,18 @@ ENVIRONMENTS: Final[list[dict[str, Any]]] = _fetch_json("/v1/environments")
 DEFAULT_ENVIRONMENT: Final[str] = _default_environment(ENVIRONMENTS)
 TOOL_DEFS: Final[list[types.Tool]] = _build_tool_defs(ENDPOINTS, DEFAULT_ENVIRONMENT)
 ENDPOINT_NAMES: Final[set[str]] = (
-    {t.name for t in TOOL_DEFS} - {"list_environments", "share_url"}
+    {t.name for t in TOOL_DEFS} - {"list_environments", "share_url", "read_share_url"}
 )
+
+_UUID_RE: Final[re.Pattern[str]] = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
+)
+
+
+def _extract_request_id(share_url: str) -> str | None:
+    """Pull the first UUID-shaped substring out of a URL or bare ID."""
+    m = _UUID_RE.search(share_url)
+    return m.group(0) if m else None
 
 server = Server("axle")
 
@@ -299,6 +333,22 @@ async def handle_call_tool(
             "request_id": request_id,
             "tool_name": tool_name,
             "saved_at": saved.get("saved_at"),
+        }
+        return [types.TextContent(type="text", text=json.dumps(payload, indent=2))]
+
+    if name == "read_share_url":
+        raw = arguments.get("share_url")
+        if not isinstance(raw, str) or not raw:
+            raise ValueError("read_share_url requires a non-empty share_url")
+        request_id = _extract_request_id(raw)
+        if request_id is None:
+            raise ValueError(
+                "read_share_url could not find a request_id UUID in the input"
+            )
+        fetched = await _get_shared_link(request_id)
+        payload = {
+            k: fetched.get(k)
+            for k in ("request_id", "tool_name", "inputs", "result", "state", "created_at")
         }
         return [types.TextContent(type="text", text=json.dumps(payload, indent=2))]
 
