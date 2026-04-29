@@ -53,3 +53,38 @@ async def test_list_environments_tool() -> None:
 async def test_none_arguments_defaults_to_empty() -> None:
     result = await handle_call_tool("list_environments", None)
     assert len(result) == 1
+
+
+async def test_share_url_with_explicit_tool_name() -> None:
+    post_mock = AsyncMock(return_value={"saved_at": "T"})
+    get_mock = AsyncMock()
+    with patch("axle_mcp_server.server._post_shared_link", post_mock), patch(
+        "axle_mcp_server.server._get_shared_link", get_mock
+    ):
+        result = await handle_call_tool(
+            "share_url", {"request_id": "rid-1", "tool_name": "verify_proof"}
+        )
+
+    post_mock.assert_called_once_with("rid-1")
+    get_mock.assert_not_called()
+    parsed = json.loads(result[0].text)
+    assert parsed["share_url"].endswith("/verify_proof#r=rid-1")
+    assert parsed["saved_at"] == "T"
+
+
+async def test_share_url_looks_up_tool_name_when_omitted() -> None:
+    post_mock = AsyncMock(return_value={"saved_at": "T"})
+    get_mock = AsyncMock(return_value={"tool_name": "merge"})
+    with patch("axle_mcp_server.server._post_shared_link", post_mock), patch(
+        "axle_mcp_server.server._get_shared_link", get_mock
+    ):
+        result = await handle_call_tool("share_url", {"request_id": "rid-2"})
+
+    get_mock.assert_called_once_with("rid-2")
+    parsed = json.loads(result[0].text)
+    assert parsed["share_url"].endswith("/merge#r=rid-2")
+
+
+async def test_share_url_rejects_missing_request_id() -> None:
+    with pytest.raises(ValueError, match="request_id"):
+        await handle_call_tool("share_url", {})

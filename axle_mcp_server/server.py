@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import urllib.error
 import urllib.request
 from typing import Any, Final, TypedDict
 
@@ -102,6 +103,55 @@ async def _call_endpoint(name: str, request: dict[str, Any]) -> Any:
     return await asyncio.to_thread(_do)
 
 
+def _make_share_url(tool_name: str, request_id: str) -> str:
+    """Webapp URL that rehydrates the form + result for a saved request."""
+    return f"{AXLE_API_URL}/{tool_name}#r={request_id}"
+
+
+async def _post_shared_link(request_id: str) -> dict[str, Any]:
+    """POST /v1/shared-links to make a request shareable via a permanent URL."""
+
+    def _do() -> dict[str, Any]:
+        url = f"{AXLE_API_URL}/v1/shared-links"
+        data = json.dumps({"request_id": request_id}).encode()
+        headers = {**_headers(), "Content-Type": "application/json"}
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req) as resp:
+                body = resp.read().decode()
+                if resp.status != 201:
+                    raise RuntimeError(f"AXLE shared-links error: {resp.status} {body}")
+                parsed = json.loads(body)
+                assert isinstance(parsed, dict)
+                return parsed
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode(errors="replace")
+            raise RuntimeError(f"AXLE shared-links error: {e.code} {err_body}") from None
+
+    return await asyncio.to_thread(_do)
+
+
+async def _get_shared_link(request_id: str) -> dict[str, Any]:
+    """GET /v1/shared-links/{request_id} to look up the saved tool_name + payload."""
+
+    def _do() -> dict[str, Any]:
+        url = f"{AXLE_API_URL}/v1/shared-links/{request_id}"
+        req = urllib.request.Request(url, headers=_headers())
+        try:
+            with urllib.request.urlopen(req) as resp:
+                body = resp.read().decode()
+                if resp.status != 200:
+                    raise RuntimeError(f"AXLE shared-links error: {resp.status} {body}")
+                parsed = json.loads(body)
+                assert isinstance(parsed, dict)
+                return parsed
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode(errors="replace")
+            raise RuntimeError(f"AXLE shared-links error: {e.code} {err_body}") from None
+
+    return await asyncio.to_thread(_do)
+
+
 def field_to_json_schema(field: InputField) -> dict[str, Any]:
     field_type = field.get("type", "text")
     schema = dict(TYPE_MAP.get(field_type, {"type": "string"}))
@@ -161,6 +211,35 @@ def _build_tool_defs(endpoints: dict[str, Any], default_environment: str) -> lis
             inputSchema={"type": "object", "properties": {}},
         )
     )
+    tools.append(
+        types.Tool(
+            name="share_url",
+            description=(
+                "Generate a permanent shareable webapp URL for an AXLE verification. "
+                "Call this when the user asks for a link they can open or share to "
+                "inspect a prior tool's inputs and result. Pass the request_id from "
+                "that tool's response (info.request_id) and the tool_name. Returns "
+                "{share_url, request_id, tool_name, saved_at}."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "request_id": {
+                        "type": "string",
+                        "description": "UUID returned in info.request_id from a prior tool call.",
+                    },
+                    "tool_name": {
+                        "type": "string",
+                        "description": (
+                            "The tool that produced the request (e.g. 'verify_proof'). "
+                            "Optional — omit and the server will look it up."
+                        ),
+                    },
+                },
+                "required": ["request_id"],
+            },
+        )
+    )
     return tools
 
 
@@ -185,7 +264,9 @@ ENDPOINTS: Final[dict[str, Any]] = _fetch_json("/v1/endpoints")
 ENVIRONMENTS: Final[list[dict[str, Any]]] = _fetch_json("/v1/environments")
 DEFAULT_ENVIRONMENT: Final[str] = _default_environment(ENVIRONMENTS)
 TOOL_DEFS: Final[list[types.Tool]] = _build_tool_defs(ENDPOINTS, DEFAULT_ENVIRONMENT)
-ENDPOINT_NAMES: Final[set[str]] = {t.name for t in TOOL_DEFS} - {"list_environments"}
+ENDPOINT_NAMES: Final[set[str]] = (
+    {t.name for t in TOOL_DEFS} - {"list_environments", "share_url"}
+)
 
 server = Server("axle")
 
@@ -204,6 +285,22 @@ async def handle_call_tool(
 
     if name == "list_environments":
         return [types.TextContent(type="text", text=json.dumps(ENVIRONMENTS, indent=2))]
+
+    if name == "share_url":
+        request_id = arguments.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("share_url requires a non-empty request_id")
+        tool_name = arguments.get("tool_name")
+        saved = await _post_shared_link(request_id)
+        if not isinstance(tool_name, str) or not tool_name:
+            tool_name = (await _get_shared_link(request_id)).get("tool_name")
+        payload = {
+            "share_url": _make_share_url(tool_name, request_id) if tool_name else None,
+            "request_id": request_id,
+            "tool_name": tool_name,
+            "saved_at": saved.get("saved_at"),
+        }
+        return [types.TextContent(type="text", text=json.dumps(payload, indent=2))]
 
     if name not in ENDPOINT_NAMES:
         raise ValueError(f"Unknown tool: {name}")
