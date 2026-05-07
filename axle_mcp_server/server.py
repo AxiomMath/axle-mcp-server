@@ -284,9 +284,29 @@ def _default_environment(environments: list[dict[str, Any]]) -> str:
     return best_name
 
 
+def _resolve_default_environment(environments: list[dict[str, Any]]) -> str:
+    """Pick the default environment, honoring `AXLE_DEFAULT_ENVIRONMENT`.
+
+    If the env var names a registered environment (e.g. `pnt-4.26.0`), use
+    it. Otherwise fall back to `_default_environment`'s latest stable
+    `lean-4.X.Y`. An unknown override raises so typos fail loudly at
+    startup rather than silently routing to the auto-picked env.
+    """
+    override = (os.environ.get("AXLE_DEFAULT_ENVIRONMENT") or "").strip()
+    if not override:
+        return _default_environment(environments)
+    known = {e["name"] for e in environments}
+    if override not in known:
+        raise RuntimeError(
+            f"AXLE_DEFAULT_ENVIRONMENT={override!r} is not a registered "
+            f"environment. Known: {sorted(known)}"
+        )
+    return override
+
+
 ENDPOINTS: Final[dict[str, Any]] = _fetch_json("/v1/endpoints")
 ENVIRONMENTS: Final[list[dict[str, Any]]] = _fetch_json("/v1/environments")
-DEFAULT_ENVIRONMENT: Final[str] = _default_environment(ENVIRONMENTS)
+DEFAULT_ENVIRONMENT: Final[str] = _resolve_default_environment(ENVIRONMENTS)
 TOOL_DEFS: Final[list[types.Tool]] = _build_tool_defs(ENDPOINTS, DEFAULT_ENVIRONMENT)
 ENDPOINT_NAMES: Final[set[str]] = (
     {t.name for t in TOOL_DEFS} - {"list_environments", "share_url", "read_share_url"}
