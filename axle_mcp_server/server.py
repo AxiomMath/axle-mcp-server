@@ -170,21 +170,28 @@ def _has_textarea_content(inputs: list[InputField]) -> bool:
 
 
 def _inject_file_uri(schema: dict[str, Any]) -> dict[str, Any]:
-    """Add file_uri as an alternative to content; encode the choice with oneOf."""
+    """Add `file_uri` as an optional alternative to `content`.
+
+    The "exactly one of content/file_uri" rule is enforced server-side in
+    `_resolve_file_uri`, not via a top-level oneOf: the Anthropic Messages API
+    (and Vertex via OpenRouter) reject oneOf/anyOf/allOf in a tool's
+    input_schema outright.
+    """
     schema["properties"]["file_uri"] = {
         "type": "string",
         "format": "uri",
         "description": (
             "file:// URI or absolute path. The server reads the file locally "
-            "and sends it as `content`. Use exactly one of `content` or "
+            "and sends it as `content`. Provide exactly one of `content` or "
             "`file_uri`. Stdio mode only."
         ),
     }
-    schema["required"] = [r for r in schema.get("required", []) if r != "content"]
-    schema["oneOf"] = [
-        {"required": ["content"]},
-        {"required": ["file_uri"]},
-    ]
+    # content is no longer required; file_uri can satisfy the call instead.
+    required = [r for r in schema.get("required", []) if r != "content"]
+    if required:
+        schema["required"] = required
+    else:
+        schema.pop("required", None)
     return schema
 
 
@@ -218,11 +225,18 @@ async def _client_roots() -> list[pathlib.Path] | None:
 async def _resolve_file_uri(
     tool_schema: dict[str, Any], arguments: dict[str, Any]
 ) -> None:
-    """Replace file_uri in arguments with content read from disk. In-place."""
+    """Replace file_uri in arguments with content read from disk. In-place.
+
+    Enforces "exactly one of content/file_uri" for content endpoints, since the
+    schema no longer encodes it (see `_inject_file_uri`).
+    """
+    accepts_file_uri = "file_uri" in tool_schema.get("properties", {})
     uri = arguments.pop("file_uri", None)
     if uri is None:
+        if accepts_file_uri and arguments.get("content") is None:
+            raise ValueError("provide exactly one of content or file_uri")
         return
-    if "file_uri" not in tool_schema.get("properties", {}):
+    if not accepts_file_uri:
         raise ValueError("file_uri is not accepted by this tool")
     if _config.http_mode:
         raise ValueError("file_uri is only supported in stdio mode")
