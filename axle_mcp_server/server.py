@@ -11,8 +11,10 @@ import importlib.metadata
 import json
 import logging
 import os
+import pathlib
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Final, TypedDict
 
@@ -34,6 +36,15 @@ _request_authorization: contextvars.ContextVar[str | None] = contextvars.Context
 _request_client_ip: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "axle_request_client_ip", default=None
 )
+
+
+# Process config, set once by main(). Alternative: a _build_server builder
+# whose handlers close over the flag.
+class _Config:
+    http_mode: bool = False
+
+
+_config = _Config()
 
 TYPE_MAP: Final[dict[str, dict[str, Any]]] = {
     "text": {"type": "string"},
@@ -152,6 +163,89 @@ async def _get_shared_link(request_id: str) -> dict[str, Any]:
     return await asyncio.to_thread(_do)
 
 
+def _has_textarea_content(inputs: list[InputField]) -> bool:
+    return any(
+        f.get("name") == "content" and f.get("type") == "textarea" for f in inputs
+    )
+
+
+def _inject_file_uri(schema: dict[str, Any]) -> dict[str, Any]:
+    """Add file_uri as an alternative to content; encode the choice with oneOf."""
+    schema["properties"]["file_uri"] = {
+        "type": "string",
+        "format": "uri",
+        "description": (
+            "file:// URI or absolute path. The server reads the file locally "
+            "and sends it as `content`. Use exactly one of `content` or "
+            "`file_uri`. Stdio mode only."
+        ),
+    }
+    schema["required"] = [r for r in schema.get("required", []) if r != "content"]
+    schema["oneOf"] = [
+        {"required": ["content"]},
+        {"required": ["file_uri"]},
+    ]
+    return schema
+
+
+def _uri_to_path(uri: str) -> pathlib.Path:
+    """Accept a file:// URI or a bare absolute path. Resolves symlinks."""
+    if uri.startswith("file://"):
+        parsed = urllib.parse.urlparse(uri)
+        return pathlib.Path(urllib.request.url2pathname(parsed.path)).resolve()
+    return pathlib.Path(uri).resolve()
+
+
+async def _client_roots() -> list[pathlib.Path] | None:
+    """Resolve the client's declared MCP roots.
+
+    Returns None if the client has no roots capability (unconstrained),
+    [] if the capability is declared but no roots are set (deny all),
+    or the list of declared roots otherwise.
+    """
+    try:
+        session = server.request_context.session
+    except LookupError:
+        return None
+    if not session.check_client_capability(
+        types.ClientCapabilities(roots=types.RootsCapability())
+    ):
+        return None
+    result = await session.list_roots()
+    return [_uri_to_path(str(r.uri)) for r in result.roots]
+
+
+async def _resolve_file_uri(
+    tool_schema: dict[str, Any], arguments: dict[str, Any]
+) -> None:
+    """Replace file_uri in arguments with content read from disk. In-place."""
+    uri = arguments.pop("file_uri", None)
+    if uri is None:
+        return
+    if "file_uri" not in tool_schema.get("properties", {}):
+        raise ValueError("file_uri is not accepted by this tool")
+    if _config.http_mode:
+        raise ValueError("file_uri is only supported in stdio mode")
+    if not isinstance(uri, str) or not uri:
+        raise ValueError("file_uri must be a non-empty string")
+    if arguments.get("content") is not None:
+        raise ValueError("provide exactly one of content or file_uri")
+
+    path = _uri_to_path(uri)
+    if not path.is_file():
+        raise ValueError(f"file_uri does not point to a regular file: {uri}")
+
+    roots = await _client_roots()
+    if roots is not None and not any(
+        path == r or r in path.parents for r in roots
+    ):
+        raise ValueError(
+            f"file_uri is outside the client's declared MCP roots: {uri}"
+        )
+
+    arguments["content"] = await asyncio.to_thread(path.read_text)
+
+
 def field_to_json_schema(field: InputField) -> dict[str, Any]:
     field_type = field.get("type", "text")
     schema = dict(TYPE_MAP.get(field_type, {"type": "string"}))
@@ -195,15 +289,22 @@ def build_input_schema(
     return schema
 
 
-def _build_tool_defs(endpoints: dict[str, Any], default_environment: str) -> list[types.Tool]:
-    tools = [
-        types.Tool(
-            name=name,
-            description=meta.get("description", name),
-            inputSchema=build_input_schema(meta.get("inputs", []), default_environment),
+def _build_tool_defs(
+    endpoints: dict[str, Any], default_environment: str
+) -> list[types.Tool]:
+    tools: list[types.Tool] = []
+    for name, meta in endpoints.items():
+        inputs = meta.get("inputs", [])
+        schema = build_input_schema(inputs, default_environment)
+        if _has_textarea_content(inputs):
+            schema = _inject_file_uri(schema)
+        tools.append(
+            types.Tool(
+                name=name,
+                description=meta.get("description", name),
+                inputSchema=schema,
+            )
         )
-        for name, meta in endpoints.items()
-    ]
     tools.append(
         types.Tool(
             name="list_environments",
@@ -375,6 +476,9 @@ async def handle_call_tool(
     if name not in ENDPOINT_NAMES:
         raise ValueError(f"Unknown tool: {name}")
 
+    tool_schema = next(t.inputSchema for t in TOOL_DEFS if t.name == name)
+    await _resolve_file_uri(tool_schema, arguments)
+
     if "environment" not in arguments:
         arguments["environment"] = DEFAULT_ENVIRONMENT
 
@@ -495,6 +599,8 @@ def main() -> None:
         help="HTTP port (default: $PORT or 8080). Ignored in stdio mode.",
     )
     args = parser.parse_args()
+
+    _config.http_mode = args.http
 
     if args.http:
         _http_main(args.host, args.port)
