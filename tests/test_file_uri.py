@@ -26,10 +26,8 @@ def test_schema_injects_file_uri_for_content_endpoints() -> None:
     assert "file_uri" in schema["properties"]
     assert schema["properties"]["file_uri"]["type"] == "string"
     assert schema["properties"]["file_uri"]["format"] == "uri"
-    assert schema["oneOf"] == [
-        {"required": ["content"]},
-        {"required": ["file_uri"]},
-    ]
+    # content drops from required: either it or file_uri satisfies the call.
+    # (No combinator is asserted here; that invariant has its own test.)
     assert "content" not in schema.get("required", [])
 
 
@@ -47,6 +45,17 @@ def test_schema_omits_file_uri_for_non_content_endpoints() -> None:
     schema = next(t.inputSchema for t in defs if t.name == "merge")
     assert "file_uri" not in schema["properties"]
     assert "oneOf" not in schema
+
+
+def test_no_tool_schema_uses_top_level_combinators() -> None:
+    # The Anthropic API (and Vertex via OpenRouter) reject oneOf/anyOf/allOf at
+    # the top level of a tool's input_schema. The full tool list ships on every
+    # request, so one bad schema fails every call, not just the offending tool.
+    # Guards all tools, including the static share/list defs.
+    for tool in srv.TOOL_DEFS:
+        for key in ("oneOf", "anyOf", "allOf"):
+            assert key not in tool.inputSchema, f"{tool.name} schema has {key}"
+        assert tool.inputSchema["type"] == "object"
 
 
 async def test_file_uri_substitutes_into_content(tmp_path: pathlib.Path) -> None:
@@ -79,6 +88,11 @@ async def test_rejects_both_content_and_file_uri(tmp_path: pathlib.Path) -> None
         await handle_call_tool(
             "check", {"content": "x", "file_uri": f.as_uri()}
         )
+
+
+async def test_rejects_neither_content_nor_file_uri() -> None:
+    with pytest.raises(ValueError, match="exactly one"):
+        await handle_call_tool("check", {})
 
 
 async def test_rejects_missing_file() -> None:
