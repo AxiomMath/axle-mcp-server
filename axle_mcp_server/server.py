@@ -303,6 +303,22 @@ def build_input_schema(
     return schema
 
 
+def _inject_verbosity(schema: dict[str, Any]) -> dict[str, Any]:
+    """Add the server-side `verbosity` knob to an endpoint's input schema."""
+    schema["properties"]["verbosity"] = {
+        "type": "string",
+        "enum": ["brief", "verbose"],
+        "default": "verbose",
+        "description": (
+            "Output detail level. \"verbose\" (default): the raw AXLE response, "
+            "pretty-printed. \"brief\": drops timings, empty message buckets, and "
+            "content that just echoes the input; emits compact JSON. Keeps all "
+            "errors/warnings/infos. Use \"brief\" to save tokens."
+        ),
+    }
+    return schema
+
+
 def _build_tool_defs(
     endpoints: dict[str, Any], default_environment: str
 ) -> list[types.Tool]:
@@ -312,6 +328,7 @@ def _build_tool_defs(
         schema = build_input_schema(inputs, default_environment)
         if _has_textarea_content(inputs):
             schema = _inject_file_uri(schema)
+        schema = _inject_verbosity(schema)
         tools.append(
             types.Tool(
                 name=name,
@@ -437,6 +454,42 @@ def _extract_request_id(share_url: str) -> str | None:
     m = _UUID_RE.search(share_url)
     return m.group(0) if m else None
 
+
+def _brief_messages(bucket: dict[str, Any]) -> dict[str, Any] | None:
+    """Keep non-empty errors/warnings/infos; None when all three are empty.
+
+    infos carries the Escher agent's `exact?`/`apply?`/`rw?` "Try this:"
+    suggestions and `#eval`/`#check` output, so it stays.
+    """
+    out = {k: bucket[k] for k in ("errors", "warnings", "infos") if bucket.get(k)}
+    return out or None
+
+
+def _briefen(result: Any, submitted_content: str | None) -> Any:
+    """Drop timings, empty buckets, and echoed-back content from a response."""
+    if not isinstance(result, dict):
+        return result
+    out: dict[str, Any] = {}
+    for key, value in result.items():
+        if key == "timings":
+            continue
+        if key in ("lean_messages", "tool_messages") and isinstance(value, dict):
+            brief = _brief_messages(value)
+            if brief is not None:
+                out[key] = brief
+            continue
+        if key == "content" and submitted_content is not None and value == submitted_content:
+            continue
+        out[key] = value
+    return out
+
+
+def _serialize_result(result: Any, verbosity: str, submitted_content: str | None) -> str:
+    """Render an endpoint response as text, honoring the verbosity level."""
+    if verbosity == "brief":
+        return json.dumps(_briefen(result, submitted_content), separators=(",", ":"))
+    return json.dumps(result, indent=2)
+
 server = Server("axle")
 
 
@@ -490,6 +543,9 @@ async def handle_call_tool(
     if name not in ENDPOINT_NAMES:
         raise ValueError(f"Unknown tool: {name}")
 
+    # Server-side knob; not forwarded to the API.
+    verbosity = arguments.pop("verbosity", "verbose")
+
     tool_schema = next(t.inputSchema for t in TOOL_DEFS if t.name == name)
     await _resolve_file_uri(tool_schema, arguments)
 
@@ -500,7 +556,8 @@ async def handle_call_tool(
 
     result = await _call_endpoint(name, request)
 
-    return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+    text = _serialize_result(result, verbosity, arguments.get("content"))
+    return [types.TextContent(type="text", text=text)]
 
 
 async def _stdio_main() -> None:
