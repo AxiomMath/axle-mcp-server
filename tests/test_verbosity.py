@@ -15,30 +15,26 @@ _FULL_RESPONSE = {
 }
 
 
-def test_briefen_drops_timings_and_empty_buckets() -> None:
+def test_briefen_drops_timings_and_empty_buckets_keeps_the_rest() -> None:
     out = _briefen(_FULL_RESPONSE, submitted_content=None)
     assert "timings" not in out
-    # tool_messages had only an error; empty warnings/infos dropped.
     assert out["tool_messages"] == {"errors": ["mismatch"]}
+    assert out["lean_messages"] == {"infos": ["Try this: exact foo"]}
     assert out["okay"] is False
     assert out["failed_declarations"] == ["foo"]
 
 
-def test_briefen_keeps_infos() -> None:
-    # The Escher agent reads exact?/apply?/rw? suggestions from infos.
-    out = _briefen(_FULL_RESPONSE, submitted_content=None)
-    assert out["lean_messages"] == {"infos": ["Try this: exact foo"]}
-
-
-def test_briefen_drops_echoed_content() -> None:
+def test_briefen_flags_echoed_content() -> None:
     content = "theorem foo : 1 = 1 := rfl\n"
     out = _briefen({"okay": True, "content": content}, submitted_content=content)
     assert "content" not in out
+    assert out["content_unchanged"] is True
 
 
 def test_briefen_keeps_transformed_content() -> None:
     out = _briefen({"content": "renamed\n"}, submitted_content="original\n")
     assert out["content"] == "renamed\n"
+    assert "content_unchanged" not in out
 
 
 def test_briefen_passthrough_non_dict() -> None:
@@ -68,9 +64,8 @@ async def test_brief_output_is_compact() -> None:
         result = await handle_call_tool("check", {"content": "x", "verbosity": "brief"})
 
     text = result[0].text
-    assert "\n" not in text  # compact, no indent
-    parsed = json.loads(text)
-    assert "timings" not in parsed
+    assert "\n" not in text
+    assert "timings" not in json.loads(text)
 
 
 async def test_full_is_default_and_pretty() -> None:
@@ -79,5 +74,5 @@ async def test_full_is_default_and_pretty() -> None:
         result = await handle_call_tool("check", {"content": "x"})
 
     text = result[0].text
-    assert "\n" in text  # indent=2 pretty-print
+    assert "\n" in text
     assert json.loads(text)["timings"]["total_ms"] == 160
