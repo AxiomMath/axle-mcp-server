@@ -312,6 +312,18 @@ def _build_tool_defs(
         schema = build_input_schema(inputs, default_environment)
         if _has_textarea_content(inputs):
             schema = _inject_file_uri(schema)
+        schema["properties"]["verbosity"] = {
+            "type": "string",
+            "enum": ["brief", "verbose"],
+            "default": "verbose",
+            "description": (
+                "Output detail level. \"verbose\" (default): the raw AXLE response, "
+                "pretty-printed. \"brief\": compact JSON; drops timings and empty "
+                "message buckets (non-empty errors/warnings/infos always survive), "
+                "and replaces content that just echoes the input with "
+                "content_unchanged=true. Use \"brief\" to save tokens."
+            ),
+        }
         tools.append(
             types.Tool(
                 name=name,
@@ -437,6 +449,26 @@ def _extract_request_id(share_url: str) -> str | None:
     m = _UUID_RE.search(share_url)
     return m.group(0) if m else None
 
+
+def _briefen(result: Any, submitted_content: str | None) -> Any:
+    if not isinstance(result, dict):
+        return result
+    out: dict[str, Any] = {}
+    for key, value in result.items():
+        if key == "timings":
+            continue
+        if key in ("lean_messages", "tool_messages") and isinstance(value, dict):
+            kept = {k: value[k] for k in ("errors", "warnings", "infos") if value.get(k)}
+            if kept:
+                out[key] = kept
+            continue
+        if key == "content" and submitted_content is not None and value == submitted_content:
+            out["content_unchanged"] = True
+            continue
+        out[key] = value
+    return out
+
+
 server = Server("axle")
 
 
@@ -490,6 +522,8 @@ async def handle_call_tool(
     if name not in ENDPOINT_NAMES:
         raise ValueError(f"Unknown tool: {name}")
 
+    verbosity = arguments.pop("verbosity", "verbose")
+
     tool_schema = next(t.inputSchema for t in TOOL_DEFS if t.name == name)
     await _resolve_file_uri(tool_schema, arguments)
 
@@ -500,7 +534,11 @@ async def handle_call_tool(
 
     result = await _call_endpoint(name, request)
 
-    return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+    if verbosity == "brief":
+        text = json.dumps(_briefen(result, arguments.get("content")), separators=(",", ":"))
+    else:
+        text = json.dumps(result, indent=2)
+    return [types.TextContent(type="text", text=text)]
 
 
 async def _stdio_main() -> None:
