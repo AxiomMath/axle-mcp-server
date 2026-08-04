@@ -8,6 +8,19 @@ manipulation tools to AI agents.
 ![](demo.gif)
 
 
+## Tools
+
+Most tools are generated from the AXLE API's `/v1/endpoints` — `verify_proof`,
+`check`, `merge`, `sorry2lemma` and friends. Alongside them the server provides:
+
+| Tool | Purpose |
+| --- | --- |
+| `read_docs` | Read the AXLE documentation. Call with no arguments for the page index, then `page="verify_proof"` for one page. |
+| `list_environments` | List the available Lean environments. |
+| `share_url` | Turn a prior call's `request_id` into a permanent shareable webapp URL. |
+| `read_share_url` | Read back the inputs and result behind a share URL. |
+
+
 ## Installation
 
 1. Create a free API key:

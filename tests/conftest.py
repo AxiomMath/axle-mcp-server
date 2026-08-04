@@ -44,4 +44,4 @@ def _patch_startup_data(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(srv, "DEFAULT_ENVIRONMENT", default_env)
     tool_defs = srv._build_tool_defs(MOCK_ENDPOINTS, default_env)
     monkeypatch.setattr(srv, "TOOL_DEFS", tool_defs)
-    monkeypatch.setattr(srv, "ENDPOINT_NAMES", {t.name for t in tool_defs} - {"list_environments"})
+    monkeypatch.setattr(srv, "ENDPOINT_NAMES", {t.name for t in tool_defs} - srv.BUILTIN_TOOLS)

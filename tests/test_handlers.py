@@ -100,7 +100,7 @@ async def test_read_share_url_extracts_uuid_from_full_url() -> None:
             "result": {"okay": True},
             "state": "succeeded",
             "created_at": "T",
-            "tier_saved": "alpha",
+            "extra_field": "x",
             "source": "hot_store",
         }
     )
@@ -114,7 +114,7 @@ async def test_read_share_url_extracts_uuid_from_full_url() -> None:
     parsed = json.loads(result[0].text)
     assert parsed["tool_name"] == "verify_proof"
     assert parsed["state"] == "succeeded"
-    assert "tier_saved" not in parsed
+    assert "extra_field" not in parsed
     assert "source" not in parsed
 
 

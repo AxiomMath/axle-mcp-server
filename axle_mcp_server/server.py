@@ -77,7 +77,7 @@ def _headers() -> dict[str, str]:
     client_ip = _request_client_ip.get()
     if client_ip:
         # AXLE may use this to attribute anonymous requests to end-user IPs
-        # when our Cloud Run egress is on its trusted-proxy list.
+        # when our egress is on its trusted-proxy list.
         h["X-Forwarded-For"] = client_ip
     return h
 
@@ -161,6 +161,83 @@ async def _get_shared_link(request_id: str) -> dict[str, Any]:
             raise RuntimeError(f"AXLE shared-links error: {e.code} {err_body}") from None
 
     return await asyncio.to_thread(_do)
+
+
+DOCS_PATH: Final[str] = "/v1/docs"
+DOCS_ALL_PATH: Final[str] = f"{DOCS_PATH}/all.json"
+
+
+class DocPage(TypedDict):
+    slug: str
+    title: str
+    html_url: str
+    markdown: str
+
+
+_docs_cache: list[DocPage] | None = None
+_docs_lock: Final[asyncio.Lock] = asyncio.Lock()
+
+
+async def _load_docs() -> list[DocPage]:
+    """Load the docs corpus once per process."""
+    global _docs_cache
+    if _docs_cache is not None:
+        return _docs_cache
+    async with _docs_lock:
+        if _docs_cache is None:
+            _docs_cache = await asyncio.to_thread(_fetch_doc_pages)
+        return _docs_cache
+
+
+def _fetch_doc_pages() -> list[DocPage]:
+    try:
+        payload = _fetch_json(DOCS_ALL_PATH)
+    except urllib.error.HTTPError as e:
+        hint = " (these docs require an API key)" if e.code in (401, 403) else ""
+        raise RuntimeError(
+            f"Could not fetch AXLE docs from {AXLE_API_URL}{DOCS_ALL_PATH}: "
+            f"{e.code} {e.reason}{hint}"
+        ) from None
+    return _pages_from_bundle(payload)
+
+
+def _pages_from_bundle(payload: Any) -> list[DocPage]:
+    """Normalize {version, pages: [{slug, title, html_url, markdown}]}, nav order."""
+    raw = payload.get("pages") if isinstance(payload, dict) else None
+    if not isinstance(raw, list) or not raw:
+        raise RuntimeError(f"{AXLE_API_URL}{DOCS_ALL_PATH} returned no pages")
+    return [
+        DocPage(
+            slug=str(entry.get("slug", "")).strip("/"),
+            title=str(entry.get("title") or entry.get("slug") or "index"),
+            html_url=str(entry.get("html_url", "")),
+            markdown=str(entry.get("markdown", "")).strip(),
+        )
+        for entry in raw
+        if isinstance(entry, dict)
+    ]
+
+
+def _find_doc_page(ref: str, pages: list[DocPage]) -> DocPage:
+    """Resolve a slug, a bare tool name, or a docs URL onto a page."""
+    key = ref.strip().split(f"{DOCS_PATH}/", 1)[-1]
+    key = key.split("#")[0].strip("/").removesuffix(".md").lower() or "index"
+    for page in pages:
+        if (page["slug"].lower() or "index") in (key, f"tools/{key}"):
+            return page
+    known = ", ".join(p["slug"] for p in pages)
+    raise ValueError(f"Unknown docs page {ref!r}. Available pages: {known}")
+
+
+def _render_doc_index(pages: list[DocPage]) -> str:
+    lines = ["# AXLE documentation index", ""]
+    lines += [f"- `{p['slug']}` — {p['title']}" for p in pages]
+    return "\n".join(lines)
+
+
+def _render_doc_page(page: DocPage) -> str:
+    source = f"Source: {page['html_url']}\n\n" if page["html_url"] else ""
+    return f"{source}{page['markdown']}"
 
 
 def _has_textarea_content(inputs: list[InputField]) -> bool:
@@ -321,6 +398,31 @@ def _build_tool_defs(
         )
     tools.append(
         types.Tool(
+            name="read_docs",
+            description=(
+                "Read the AXLE documentation. Consult this before using an AXLE tool "
+                "on anything non-trivial: each tool has a docs page covering its input "
+                "semantics, output shape, Lean conventions and failure modes. Call with "
+                "no arguments for the page index, then with page='verify_proof' (or any "
+                "slug from that index) to read a page. Returns markdown."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page": {
+                        "type": "string",
+                        "description": (
+                            "Page slug from the index, e.g. 'quickstart', "
+                            "'troubleshooting', 'tools/verify_proof' (bare tool names "
+                            "like 'verify_proof' also work). Omit for the index."
+                        ),
+                    },
+                },
+            },
+        )
+    )
+    tools.append(
+        types.Tool(
             name="list_environments",
             description="List available Lean environments on the AXLE server.",
             inputSchema={"type": "object", "properties": {}},
@@ -423,9 +525,13 @@ ENDPOINTS: Final[dict[str, Any]] = _fetch_json("/v1/endpoints")
 ENVIRONMENTS: Final[list[dict[str, Any]]] = _fetch_json("/v1/environments")
 DEFAULT_ENVIRONMENT: Final[str] = _resolve_default_environment(ENVIRONMENTS)
 TOOL_DEFS: Final[list[types.Tool]] = _build_tool_defs(ENDPOINTS, DEFAULT_ENVIRONMENT)
-ENDPOINT_NAMES: Final[set[str]] = (
-    {t.name for t in TOOL_DEFS} - {"list_environments", "share_url", "read_share_url"}
-)
+BUILTIN_TOOLS: Final[set[str]] = {
+    "read_docs",
+    "list_environments",
+    "share_url",
+    "read_share_url",
+}
+ENDPOINT_NAMES: Final[set[str]] = {t.name for t in TOOL_DEFS} - BUILTIN_TOOLS
 
 _UUID_RE: Final[re.Pattern[str]] = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
@@ -451,6 +557,15 @@ async def handle_call_tool(
 ) -> list[types.TextContent]:
     if arguments is None:
         arguments = {}
+
+    if name == "read_docs":
+        pages = await _load_docs()
+        page_arg = arguments.get("page")
+        if isinstance(page_arg, str) and page_arg.strip():
+            text = _render_doc_page(_find_doc_page(page_arg, pages))
+        else:
+            text = _render_doc_index(pages)
+        return [types.TextContent(type="text", text=text)]
 
     if name == "list_environments":
         return [types.TextContent(type="text", text=json.dumps(ENVIRONMENTS, indent=2))]
