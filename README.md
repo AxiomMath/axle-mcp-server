@@ -64,9 +64,7 @@ this once; after setup, Axle is available in every future conversation.
 4. Fill in:
    - **Name:** `Axle`
    - **Remote MCP server URL:** `https://mcp.axiommath.ai/mcp`
-5. Expand **Advanced settings** and paste the API key from step 1 as the
-   **OAuth Client ID / Bearer token**.
-6. Click **Add**.
-7. In any chat, open the tools menu (the **+** or paperclip icon in the
+5. Click **Add**.
+6. In any chat, open the tools menu (the **+** or paperclip icon in the
    composer) → **Connectors** → toggle **Axle** on. You should see the Axle
    tools listed.
