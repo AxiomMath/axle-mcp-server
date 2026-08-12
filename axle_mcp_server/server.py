@@ -690,11 +690,30 @@ def _build_http_app() -> Any:
         lifespan=lifespan,
     )
 
+    async def reject_stream(send: Any) -> None:
+        """405 the GET/SSE stream, which the spec allows in place of a stream.
+
+        Stateless mode builds a fresh transport per request, so a GET stream has
+        no session to receive server-initiated messages and stays open emitting
+        nothing. Cloud Run withholds the response headers until the first body
+        byte, so a client sees silence rather than an idle stream and waits until
+        it times out. 405 tells it to use POST instead.
+        """
+        await send({
+            "type": "http.response.start",
+            "status": 405,
+            "headers": [(b"content-type", b"text/plain; charset=utf-8"), (b"allow", b"POST")],
+        })
+        await send({"type": "http.response.body", "body": b"POST to /mcp; SSE stream unsupported"})
+
     # ASGI wrapper: route /mcp (with or without trailing slash) straight to the
     # MCP handler. Skipping Starlette's Mount avoids a 307 redirect on /mcp
     # that Claude's web connector doesn't follow on POST.
     async def app(scope: Any, receive: Any, send: Any) -> None:
         if scope.get("type") == "http" and scope.get("path") in ("/mcp", "/mcp/"):
+            if scope.get("method") in ("GET", "HEAD"):
+                await reject_stream(send)
+                return
             await handle_mcp(scope, receive, send)
             return
         await starlette_app(scope, receive, send)
