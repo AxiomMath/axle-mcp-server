@@ -699,7 +699,36 @@ def _build_http_app() -> Any:
     provider = auth.AxleOAuthProvider(codec, axle_api_url=lambda: AXLE_API_URL)
     allow_anonymous = os.environ.get("AXLE_MCP_ALLOW_ANONYMOUS", "").lower() in ("1", "true", "yes")
 
+    cors_headers = [
+        (b"access-control-allow-origin", b"*"),
+        (b"access-control-expose-headers", b"WWW-Authenticate, Mcp-Session-Id, Mcp-Protocol-Version"),
+    ]
+
+    def with_cors(send: Any) -> Any:
+        """Add permissive CORS headers so browser-based MCP clients can call /mcp."""
+
+        async def _send(message: dict[str, Any]) -> None:
+            if message.get("type") == "http.response.start":
+                message = {**message, "headers": [*message.get("headers", []), *cors_headers]}
+            await send(message)
+
+        return _send
+
+    async def preflight(send: Any) -> None:
+        await send({
+            "type": "http.response.start",
+            "status": 204,
+            "headers": [
+                *cors_headers,
+                (b"access-control-allow-methods", b"POST, OPTIONS"),
+                (b"access-control-allow-headers", b"Authorization, Content-Type, Accept, Mcp-Session-Id, Mcp-Protocol-Version"),
+                (b"access-control-max-age", b"86400"),
+            ],
+        })
+        await send({"type": "http.response.body", "body": b""})
+
     async def handle_mcp(scope: Any, receive: Any, send: Any) -> None:
+        send = with_cors(send)
         authorization, client_ip = _extract_request_context(scope)
         base_url = auth.public_base_url(scope)
         if authorization is None and allow_anonymous:
@@ -783,6 +812,9 @@ def _build_http_app() -> Any:
         base_token = auth.bind_base_url(scope)
         try:
             if scope.get("path") in ("/mcp", "/mcp/"):
+                if scope.get("method") == "OPTIONS":
+                    await preflight(send)
+                    return
                 if scope.get("method") in ("GET", "HEAD"):
                     await reject_stream(send)
                     return

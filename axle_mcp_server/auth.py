@@ -27,6 +27,7 @@ import base64
 import contextvars
 import hashlib
 import html
+import http.client
 import ipaddress
 import json
 import logging
@@ -53,7 +54,6 @@ from mcp.server.auth.provider import (
     AuthorizationParams,
     RefreshToken,
     TokenError,
-    construct_redirect_uri,
 )
 from mcp.shared.auth import (
     InvalidRedirectUriError,
@@ -85,6 +85,7 @@ CIMD_CACHE_TTL: Final[int] = 5 * 60
 CIMD_NEGATIVE_CACHE_TTL: Final[int] = 60
 RAW_KEY_OK_TTL: Final[int] = 5 * 60
 RAW_KEY_BAD_TTL: Final[int] = 60
+RAW_KEY_UNAVAILABLE_TTL: Final[int] = 30
 
 DOCS_URL: Final[str] = "https://github.com/AxiomMath/axle-mcp-server"
 CONSOLE_URL: Final[str] = "https://axle.axiommath.ai/app/console"
@@ -114,8 +115,8 @@ def public_base_url(scope: Any) -> str:
     }
     scheme = headers.get("x-forwarded-proto", scope.get("scheme") or "http")
     scheme = scheme.split(",", 1)[0].strip() or "http"
-    host = headers.get("x-forwarded-host") or headers.get("host") or ""
-    host = host.split(",", 1)[0].strip()
+    # Host is what the proxy (Cloud Run) validated; X-Forwarded-Host is not trusted.
+    host = (headers.get("host") or "").split(",", 1)[0].strip()
     if not host:
         server = scope.get("server")
         host = f"{server[0]}:{server[1]}" if server else "localhost"
@@ -196,6 +197,14 @@ def check_redirect_uri_allowed(url: str) -> None:
         raise ValueError(f"redirect URI must not have a fragment: {url}")
     if p.scheme == "http" and not is_loopback_redirect(url):
         raise ValueError(f"http redirect URIs are only allowed for loopback hosts: {url}")
+
+
+def append_query(url: str, **params: str | None) -> str:
+    """Add query parameters to a redirect URI, keeping its existing ones (even blank)."""
+    parts = urllib.parse.urlsplit(url)
+    query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    query += [(k, v) for k, v in params.items() if v is not None]
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
 
 
 def is_cimd_client_id(client_id: str) -> bool:
@@ -328,7 +337,7 @@ def verify_api_key(api_url: str, api_key: str) -> bool:
         if e.code in (401, 403):
             return False
         raise AxleUnavailable(f"AXLE returned HTTP {e.code}") from None
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as e:
         raise AxleUnavailable(str(e)) from None
 
 
@@ -455,6 +464,8 @@ class AxleOAuthProvider:
     def register(self, metadata: OAuthClientMetadata) -> dict[str, Any]:
         """Dynamic client registration. Returns the RFC 7591 response body."""
         redirect_uris = [str(u) for u in metadata.redirect_uris or []]
+        if not redirect_uris:
+            raise ValueError("redirect_uris is required")
         for uri in redirect_uris:
             check_redirect_uri_allowed(uri)
         method = metadata.token_endpoint_auth_method or "none"
@@ -488,23 +499,30 @@ class AxleOAuthProvider:
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         record = self.codec.open("c", client_id)
         if record is not None:
-            host = urllib.parse.urlsplit(record.get("client_uri") or "").hostname
-            return Client(
-                client_id=client_id,
-                client_secret=record.get("client_secret"),
-                client_id_issued_at=record.get("client_id_issued_at"),
-                redirect_uris=[AnyUrl(u) for u in record["redirect_uris"]],
-                token_endpoint_auth_method=record["token_endpoint_auth_method"],
-                grant_types=record["grant_types"],
-                response_types=record["response_types"],
-                client_name=record.get("client_name"),
-                scope=record.get("scope"),
-                display_label=record.get("client_name") or "an MCP client",
-                display_host=host,
-            )
+            try:
+                return self._client_from_record(client_id, record)
+            except (ValidationError, KeyError, ValueError):
+                return None
         if is_cimd_client_id(client_id):
             return await self._get_cimd_client(client_id)
         return None
+
+    @staticmethod
+    def _client_from_record(client_id: str, record: dict[str, Any]) -> Client:
+        host = urllib.parse.urlsplit(record.get("client_uri") or "").hostname
+        return Client(
+            client_id=client_id,
+            client_secret=record.get("client_secret"),
+            client_id_issued_at=record.get("client_id_issued_at"),
+            redirect_uris=[AnyUrl(u) for u in record["redirect_uris"]],
+            token_endpoint_auth_method=record["token_endpoint_auth_method"],
+            grant_types=record["grant_types"],
+            response_types=record["response_types"],
+            client_name=record.get("client_name"),
+            scope=record.get("scope"),
+            display_label=record.get("client_name") or "an MCP client",
+            display_host=host,
+        )
 
     async def _get_cimd_client(self, url: str) -> Client | None:
         now = time.time()
@@ -517,7 +535,7 @@ class AxleOAuthProvider:
             async with self._fetch_limit:
                 doc = await anyio.to_thread.run_sync(fetch_client_metadata_document, url)
             client = client_from_cimd(url, doc)
-        except (ValueError, OSError) as e:
+        except (ValueError, OSError, http.client.HTTPException) as e:
             logger.warning("Rejected CIMD client %s: %s", url, e)
             client = None
         with self._lock:
@@ -628,12 +646,15 @@ class AxleOAuthProvider:
         refresh_token: AxleRefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
-        # Rotation: every refresh hands out a fresh refresh token.
+        # A new refresh token is handed out on every refresh, but it inherits the original
+        # sign-in's expiry: tokens are stateless, so the chain cannot be revoked, and this
+        # caps it at REFRESH_TOKEN_TTL after the user last typed their key.
         return self._issue_tokens(
             client_id=str(client.client_id),
             api_key=refresh_token.api_key,
             scopes=scopes,
             resource=refresh_token.resource,
+            refresh_expires_at=refresh_token.expires_at,
         )
 
     async def load_access_token(self, token: str) -> AxleAccessToken | None:
@@ -654,7 +675,13 @@ class AxleOAuthProvider:
         return None
 
     def _issue_tokens(
-        self, *, client_id: str, api_key: str, scopes: list[str], resource: str | None
+        self,
+        *,
+        client_id: str,
+        api_key: str,
+        scopes: list[str],
+        resource: str | None,
+        refresh_expires_at: int | None = None,
     ) -> OAuthToken:
         common = {
             "client_id": client_id,
@@ -662,12 +689,15 @@ class AxleOAuthProvider:
             "scopes": scopes,
             "resource": resource,
         }
+        refresh_ttl = REFRESH_TOKEN_TTL
+        if refresh_expires_at is not None:
+            refresh_ttl = max(0, int(refresh_expires_at - time.time()))
         return OAuthToken(
             access_token=self.codec.seal("at", common, ACCESS_TOKEN_TTL),
             token_type="Bearer",
             expires_in=ACCESS_TOKEN_TTL,
             scope=" ".join(scopes) if scopes else None,
-            refresh_token=self.codec.seal("rt", common, REFRESH_TOKEN_TTL),
+            refresh_token=self.codec.seal("rt", common, refresh_ttl),
         )
 
     # -- resource server ----------------------------------------------------------
@@ -710,9 +740,14 @@ class AxleOAuthProvider:
             ok = await anyio.to_thread.run_sync(verify_api_key, self.axle_api_url(), api_key)
         except AxleUnavailable as e:
             # Don't lock users out because AXLE hiccuped; the tool call itself will
-            # surface the upstream error.
+            # surface the upstream error. Remember the decision briefly so an outage
+            # does not cost a blocked thread per request.
             logger.warning("Could not validate API key against AXLE: %s", e)
-            return True
+            ok = True
+            with self._lock:
+                _prune(self._raw_key_cache, now, 10000)
+                self._raw_key_cache[digest] = (now + RAW_KEY_UNAVAILABLE_TTL, True)
+            return ok
         with self._lock:
             _prune(self._raw_key_cache, now, 10000)
             self._raw_key_cache[digest] = (now + (RAW_KEY_OK_TTL if ok else RAW_KEY_BAD_TTL), ok)
@@ -850,6 +885,14 @@ def build_routes(provider: AxleOAuthProvider) -> list[Route]:
     authorization_handler = AuthorizationHandler(provider)
     token_handler = TokenHandler(provider, ClientAuthenticator(provider))
     no_store = {"Cache-Control": "no-store"}
+    # The login page takes a secret: never let it be framed, never leak the URL onwards.
+    page_headers = {
+        **no_store,
+        "X-Frame-Options": "DENY",
+        "Content-Security-Policy": "frame-ancestors 'none'; default-src 'none'; style-src 'unsafe-inline'",
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+    }
 
     def base_of(request: Request) -> str:
         return public_base_url(request.scope)
@@ -892,9 +935,9 @@ def build_routes(provider: AxleOAuthProvider) -> list[Route]:
                     "your AI client and start the connection again."
                 ),
                 status_code=400,
-                headers=no_store,
+                headers=page_headers,
             )
-        return HTMLResponse(render_login_page(blob, pending), headers=no_store)
+        return HTMLResponse(render_login_page(blob, pending), headers=page_headers)
 
     async def login_post(request: Request) -> Response:
         form = await request.form()
@@ -907,13 +950,13 @@ def build_routes(provider: AxleOAuthProvider) -> list[Route]:
                     "your AI client and start the connection again."
                 ),
                 status_code=400,
-                headers=no_store,
+                headers=page_headers,
             )
         redirect_uri = pending["redirect_uri"]
         state = pending.get("state")
         if form.get("action") == "deny":
             return RedirectResponse(
-                construct_redirect_uri(
+                append_query(
                     redirect_uri,
                     error="access_denied",
                     error_description="User cancelled",
@@ -927,7 +970,7 @@ def build_routes(provider: AxleOAuthProvider) -> list[Route]:
             return HTMLResponse(
                 render_login_page(blob, pending, "Please paste a valid AXLE API key."),
                 status_code=400,
-                headers=no_store,
+                headers=page_headers,
             )
         try:
             ok = await anyio.to_thread.run_sync(verify_api_key, provider.axle_api_url(), api_key)
@@ -940,7 +983,7 @@ def build_routes(provider: AxleOAuthProvider) -> list[Route]:
                     "AXLE could not be reached to verify the key. Try again in a moment.",
                 ),
                 status_code=502,
-                headers=no_store,
+                headers=page_headers,
             )
         if not ok:
             return HTMLResponse(
@@ -950,11 +993,11 @@ def build_routes(provider: AxleOAuthProvider) -> list[Route]:
                     "AXLE rejected this API key. Check it in the console and try again.",
                 ),
                 status_code=400,
-                headers=no_store,
+                headers=page_headers,
             )
         code = provider.issue_authorization_code(pending, api_key)
         return RedirectResponse(
-            construct_redirect_uri(redirect_uri, code=code, state=state, iss=base_of(request)),
+            append_query(redirect_uri, code=code, state=state, iss=base_of(request)),
             status_code=302,
             headers=no_store,
         )

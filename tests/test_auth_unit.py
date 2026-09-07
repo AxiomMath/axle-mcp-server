@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.parse
 from typing import Any
 
 import pytest
@@ -59,7 +60,9 @@ def test_codec_ephemeral_secret_warns(caplog: pytest.LogCaptureFixture) -> None:
 
 
 def test_canonical_resource() -> None:
-    assert auth.canonical_resource("HTTPS://MCP.Example.com:443/mcp/") == "https://mcp.example.com/mcp"
+    assert (
+        auth.canonical_resource("HTTPS://MCP.Example.com:443/mcp/") == "https://mcp.example.com/mcp"
+    )
     assert auth.canonical_resource("http://localhost:8080/mcp") == "http://localhost:8080/mcp"
     assert auth.canonical_resource("https://x.test") == "https://x.test"
 
@@ -67,8 +70,16 @@ def test_canonical_resource() -> None:
 @pytest.mark.parametrize(
     ("registered", "requested", "ok"),
     [
-        ("https://claude.ai/api/mcp/auth_callback", "https://claude.ai/api/mcp/auth_callback", True),
-        ("https://claude.ai/api/mcp/auth_callback", "https://evil.test/api/mcp/auth_callback", False),
+        (
+            "https://claude.ai/api/mcp/auth_callback",
+            "https://claude.ai/api/mcp/auth_callback",
+            True,
+        ),
+        (
+            "https://claude.ai/api/mcp/auth_callback",
+            "https://evil.test/api/mcp/auth_callback",
+            False,
+        ),
         ("http://localhost/callback", "http://localhost:3118/callback", True),
         ("http://127.0.0.1/callback", "http://127.0.0.1:52011/callback", True),
         ("http://localhost/callback", "http://localhost:3118/other", False),
@@ -163,11 +174,16 @@ def test_dcr_rejects_bad_redirects_and_methods(provider: auth.AxleOAuthProvider)
     from mcp.shared.auth import OAuthClientMetadata
 
     with pytest.raises(ValueError, match="redirect"):
-        provider.register(OAuthClientMetadata.model_validate({"redirect_uris": ["http://evil.test/cb"]}))
+        provider.register(
+            OAuthClientMetadata.model_validate({"redirect_uris": ["http://evil.test/cb"]})
+        )
     with pytest.raises(ValueError, match="token_endpoint_auth_method"):
         provider.register(
             OAuthClientMetadata.model_validate(
-                {"redirect_uris": ["https://a.test/cb"], "token_endpoint_auth_method": "private_key_jwt"}
+                {
+                    "redirect_uris": ["https://a.test/cb"],
+                    "token_endpoint_auth_method": "private_key_jwt",
+                }
             )
         )
 
@@ -179,7 +195,9 @@ async def test_unknown_client_ids(provider: auth.AxleOAuthProvider) -> None:
     assert await provider.get_client("https://example.test") is None
 
 
-async def test_cimd_client(provider: auth.AxleOAuthProvider, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_cimd_client(
+    provider: auth.AxleOAuthProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
     url = "https://claude.ai/oauth/claude-code-client-metadata"
     doc = {
         "client_id": url,
@@ -215,7 +233,10 @@ async def test_cimd_rejects_mismatched_document(
     monkeypatch.setattr(
         auth,
         "fetch_client_metadata_document",
-        lambda u: {"client_id": "https://other.test/x", "redirect_uris": ["https://client.test/cb"]},
+        lambda u: {
+            "client_id": "https://other.test/x",
+            "redirect_uris": ["https://client.test/cb"],
+        },
     )
     assert await provider.get_client(url) is None
     monkeypatch.setattr(
@@ -237,13 +258,15 @@ async def test_issued_token_resolves_to_api_key(provider: auth.AxleOAuthProvider
     upstream = await provider.resolve_upstream_authorization(f"Bearer {tokens.access_token}", BASE)
     assert upstream == "Bearer sk-user"
     # Case-insensitive scheme, trailing-slash-insensitive resource.
-    assert await provider.resolve_upstream_authorization(f"bearer {tokens.access_token}", BASE + "/") == (
-        "Bearer sk-user"
-    )
+    assert await provider.resolve_upstream_authorization(
+        f"bearer {tokens.access_token}", BASE + "/"
+    ) == ("Bearer sk-user")
 
 
 async def test_issued_token_for_other_resource_rejected(provider: auth.AxleOAuthProvider) -> None:
-    tokens = provider._issue_tokens(client_id="c", api_key="k", scopes=[], resource="https://other.test/mcp")
+    tokens = provider._issue_tokens(
+        client_id="c", api_key="k", scopes=[], resource="https://other.test/mcp"
+    )
     with pytest.raises(auth.AuthFailure) as ei:
         await provider.resolve_upstream_authorization(f"Bearer {tokens.access_token}", BASE)
     assert ei.value.error == "invalid_token"
@@ -291,7 +314,9 @@ async def test_raw_api_key_passes_when_axle_unavailable(
         raise auth.AxleUnavailable("down")
 
     monkeypatch.setattr(auth, "verify_api_key", boom)
-    assert await provider.resolve_upstream_authorization("Bearer whatever", BASE) == "Bearer whatever"
+    assert (
+        await provider.resolve_upstream_authorization("Bearer whatever", BASE) == "Bearer whatever"
+    )
 
 
 async def test_authorization_code_single_use(provider: auth.AxleOAuthProvider) -> None:
@@ -340,7 +365,9 @@ def test_www_authenticate_header() -> None:
         f'Bearer resource_metadata="{BASE}/.well-known/oauth-protected-resource/mcp"'
     )
     h = auth.www_authenticate(BASE, auth.AuthFailure("invalid_token", "expired"))
-    assert h.startswith('Bearer error="invalid_token", error_description="expired", resource_metadata=')
+    assert h.startswith(
+        'Bearer error="invalid_token", error_description="expired", resource_metadata='
+    )
 
 
 async def test_login_page_renders_client_and_redirect_host(codec: auth.TokenCodec) -> None:
@@ -360,7 +387,11 @@ async def test_login_page_renders_client_and_redirect_host(codec: auth.TokenCode
 
 
 async def _call(
-    app: Any, method: str, path: str, headers: list[tuple[bytes, bytes]] | None = None, body: bytes = b""
+    app: Any,
+    method: str,
+    path: str,
+    headers: list[tuple[bytes, bytes]] | None = None,
+    body: bytes = b"",
 ) -> tuple[int, dict[str, str], bytes]:
     sent: list[dict[str, Any]] = []
 
@@ -438,7 +469,10 @@ async def test_anonymous_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 async def test_discovery_endpoints(app: Any) -> None:
-    for path in ("/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"):
+    for path in (
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/mcp",
+    ):
         status, headers, body = await _call(app, "GET", path)
         assert status == 200, path
         doc = json.loads(body)
@@ -510,7 +544,9 @@ def test_prune_keeps_fresh_entries_under_flood() -> None:
     assert list(cache) == ["fresh"]
 
 
-async def test_cimd_negative_cache(provider: auth.AxleOAuthProvider, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_cimd_negative_cache(
+    provider: auth.AxleOAuthProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
     calls: list[str] = []
 
     def bad_fetch(u: str) -> Any:
@@ -558,7 +594,111 @@ async def test_oversized_oauth_bodies_are_rejected(app: Any) -> None:
         app,
         "POST",
         "/register",
-        headers=[(b"content-type", b"application/json"), (b"content-length", str(len(big)).encode())],
+        headers=[
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(big)).encode()),
+        ],
         body=big,
     )
     assert status == 413
+
+
+# --- second review pass ------------------------------------------------------------------
+
+
+def test_append_query_keeps_blank_and_existing_params() -> None:
+    out = auth.append_query(
+        "https://app.test/cb?ctx=&flag&keep=1", code="C", state=None, iss="https://i"
+    )
+    q = urllib.parse.parse_qsl(urllib.parse.urlsplit(out).query, keep_blank_values=True)
+    assert q == [("ctx", ""), ("flag", ""), ("keep", "1"), ("code", "C"), ("iss", "https://i")]
+
+
+def test_register_requires_redirect_uris(provider: auth.AxleOAuthProvider) -> None:
+    from mcp.shared.auth import OAuthClientMetadata
+
+    with pytest.raises(ValueError, match="redirect_uris"):
+        provider.register(OAuthClientMetadata.model_validate({"redirect_uris": None}))
+
+
+async def test_register_null_redirect_uris_is_400_not_500(app: Any) -> None:
+    body = json.dumps({"redirect_uris": None, "client_name": "x"}).encode()
+    status, _, out = await _call(
+        app, "POST", "/register", headers=[(b"content-type", b"application/json")], body=body
+    )
+    assert status == 400
+    assert json.loads(out)["error"] == "invalid_redirect_uri"
+
+
+def test_verify_api_key_maps_http_client_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    import http.client
+
+    def boom(*a: Any, **k: Any) -> Any:
+        raise http.client.RemoteDisconnected("gone")
+
+    monkeypatch.setattr(auth.urllib.request, "urlopen", boom)
+    with pytest.raises(auth.AxleUnavailable):
+        auth.verify_api_key("https://axle.invalid", "k")
+
+
+async def test_refresh_does_not_extend_session(provider: auth.AxleOAuthProvider) -> None:
+    client = auth.Client(client_id="c", redirect_uris=[AnyUrl("https://a.test/cb")])
+    first = provider._issue_tokens(client_id="c", api_key="k", scopes=[], resource=None)
+    rt1 = await provider.load_refresh_token(client, first.refresh_token or "")
+    assert rt1 is not None
+    second = await provider.exchange_refresh_token(client, rt1, [])
+    rt2 = await provider.load_refresh_token(client, second.refresh_token or "")
+    assert rt2 is not None and rt2.expires_at is not None and rt1.expires_at is not None
+    assert rt2.expires_at <= rt1.expires_at
+    assert second.access_token != first.access_token
+
+
+async def test_raw_key_fail_open_is_cached(
+    provider: auth.AxleOAuthProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    def boom(api_url: str, key: str) -> bool:
+        calls.append(key)
+        raise auth.AxleUnavailable("down")
+
+    monkeypatch.setattr(auth, "verify_api_key", boom)
+    await provider.resolve_upstream_authorization("Bearer k1", BASE)
+    await provider.resolve_upstream_authorization("Bearer k1", BASE)
+    assert calls == ["k1"]
+
+
+async def test_login_page_cannot_be_framed(app: Any) -> None:
+    status, headers, _ = await _call(app, "GET", "/login")
+    assert status == 400
+    assert headers["x-frame-options"] == "DENY"
+    assert "frame-ancestors 'none'" in headers["content-security-policy"]
+    assert headers["referrer-policy"] == "no-referrer"
+
+
+async def test_mcp_cors_preflight_and_exposed_401(app: Any) -> None:
+    status, headers, _ = await _call(
+        app,
+        "OPTIONS",
+        "/mcp",
+        headers=[
+            (b"origin", b"https://inspector.test"),
+            (b"access-control-request-method", b"POST"),
+        ],
+    )
+    assert status == 204
+    assert headers["access-control-allow-origin"] == "*"
+    assert "Authorization" in headers["access-control-allow-headers"]
+    status, headers, _ = await _call(app, "POST", "/mcp", body=b"{}")
+    assert status == 401
+    assert headers["access-control-allow-origin"] == "*"
+    assert "WWW-Authenticate" in headers["access-control-expose-headers"]
+
+
+def test_forwarded_host_is_not_trusted(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AXLE_MCP_PUBLIC_URL", raising=False)
+    scope = {
+        "scheme": "https",
+        "headers": [(b"host", b"real.test"), (b"x-forwarded-host", b"evil.test")],
+    }
+    assert auth.public_base_url(scope) == "https://real.test"

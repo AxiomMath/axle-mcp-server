@@ -154,7 +154,8 @@ its own OAuth 2.1 authorization server:
   sees the key.
 - On every MCP request the server unseals the key and forwards it to AXLE as
   `Authorization: Bearer <key>`. Access tokens last one hour and are refreshed
-  automatically by the client; refresh tokens last 90 days.
+  automatically by the client; refresh tokens expire 90 days after you last
+  signed in.
 - A raw AXLE API key sent directly as `Authorization: Bearer <key>` is also
   accepted (after being validated against AXLE), which is what the header-based
   setups above use.
@@ -178,7 +179,7 @@ docker run -p 8080:8080 \
 | `AXLE_API_URL` | Upstream AXLE API. Default `https://axle.axiommath.ai`. |
 | `AXLE_DEFAULT_ENVIRONMENT` | Override the default Lean environment (default: newest `lean-4.x.y`). |
 | `AXLE_MCP_ALLOW_ANONYMOUS` | `1` to also serve requests that carry no credentials at all (AXLE's anonymous tier). Off by default. |
-| `AXLE_API_KEY` | stdio mode only: the key sent to AXLE. |
+| `AXLE_API_KEY` | The key sent to AXLE in stdio mode. In HTTP mode it is only used for requests that carry no credentials when `AXLE_MCP_ALLOW_ANONYMOUS=1`. |
 | `PORT` | HTTP port (default 8080). |
 
 The MCP endpoint must be reachable over public HTTPS with no redirects on
