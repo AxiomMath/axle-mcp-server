@@ -6,58 +6,23 @@ MOCK_ENDPOINTS = {
     "check": {
         "description": "Evaluate Lean code and collect all messages.",
         "inputs": [
-            {
-                "name": "content",
-                "type": "textarea",
-                "description": "Lean source code",
-                "required": True,
-            },
-            {
-                "name": "environment",
-                "type": "text",
-                "description": "Lean environment",
-                "required": True,
-            },
+            {"name": "content", "type": "textarea", "description": "Lean source code", "required": True},
+            {"name": "environment", "type": "text", "description": "Lean environment", "required": True},
         ],
     },
     "verify_proof": {
         "description": "Validate a candidate Lean theorem.",
         "inputs": [
-            {
-                "name": "formal_statement",
-                "type": "textarea",
-                "description": "Sorried theorem",
-                "required": True,
-            },
-            {
-                "name": "content",
-                "type": "textarea",
-                "description": "Candidate proof",
-                "required": True,
-            },
-            {
-                "name": "environment",
-                "type": "text",
-                "description": "Lean environment",
-                "required": True,
-            },
+            {"name": "formal_statement", "type": "textarea", "description": "Sorried theorem", "required": True},
+            {"name": "content", "type": "textarea", "description": "Candidate proof", "required": True},
+            {"name": "environment", "type": "text", "description": "Lean environment", "required": True},
         ],
     },
     "merge": {
         "description": "Merge Lean documents.",
         "inputs": [
-            {
-                "name": "documents",
-                "type": "textarea_list",
-                "description": "Lean documents",
-                "required": True,
-            },
-            {
-                "name": "environment",
-                "type": "text",
-                "description": "Lean environment",
-                "required": True,
-            },
+            {"name": "documents", "type": "textarea_list", "description": "Lean documents", "required": True},
+            {"name": "environment", "type": "text", "description": "Lean environment", "required": True},
         ],
     },
 }

@@ -30,7 +30,9 @@ async def test_check_respects_explicit_environment() -> None:
     with patch("axle_mcp_server.server._call_endpoint", mock):
         await handle_call_tool("check", {"content": "x", "environment": "lean-4.21.0"})
 
-    mock.assert_called_once_with("check", {"content": "x", "environment": "lean-4.21.0"})
+    mock.assert_called_once_with(
+        "check", {"content": "x", "environment": "lean-4.21.0"}
+    )
 
 
 async def test_strips_none_values() -> None:
@@ -56,9 +58,8 @@ async def test_none_arguments_defaults_to_empty() -> None:
 async def test_share_url_with_explicit_tool_name() -> None:
     post_mock = AsyncMock(return_value={"saved_at": "T"})
     get_mock = AsyncMock()
-    with (
-        patch("axle_mcp_server.server._post_shared_link", post_mock),
-        patch("axle_mcp_server.server._get_shared_link", get_mock),
+    with patch("axle_mcp_server.server._post_shared_link", post_mock), patch(
+        "axle_mcp_server.server._get_shared_link", get_mock
     ):
         result = await handle_call_tool(
             "share_url", {"request_id": "rid-1", "tool_name": "verify_proof"}
@@ -74,9 +75,8 @@ async def test_share_url_with_explicit_tool_name() -> None:
 async def test_share_url_looks_up_tool_name_when_omitted() -> None:
     post_mock = AsyncMock(return_value={"saved_at": "T"})
     get_mock = AsyncMock(return_value={"tool_name": "merge"})
-    with (
-        patch("axle_mcp_server.server._post_shared_link", post_mock),
-        patch("axle_mcp_server.server._get_shared_link", get_mock),
+    with patch("axle_mcp_server.server._post_shared_link", post_mock), patch(
+        "axle_mcp_server.server._get_shared_link", get_mock
     ):
         result = await handle_call_tool("share_url", {"request_id": "rid-2"})
 

@@ -89,7 +89,9 @@ def test_bundle_rejects_unusable_payloads(payload: Any) -> None:
         ("quickstart", "quickstart"),
     ],
 )
-def test_find_doc_page_accepts_slugs_bare_names_and_urls(given: str, expected: str) -> None:
+def test_find_doc_page_accepts_slugs_bare_names_and_urls(
+    given: str, expected: str
+) -> None:
     assert srv._find_doc_page(given, MOCK_PAGES)["slug"] == expected
 
 
@@ -136,7 +138,9 @@ async def test_load_docs_fetches_once_and_caches(monkeypatch: pytest.MonkeyPatch
     assert calls == ["/v1/docs/all.json"]
 
 
-@pytest.mark.parametrize(("code", "match"), [(401, "require an API key"), (404, "404")])
+@pytest.mark.parametrize(
+    ("code", "match"), [(401, "require an API key"), (404, "404")]
+)
 async def test_load_docs_surfaces_http_errors(
     monkeypatch: pytest.MonkeyPatch, code: int, match: str
 ) -> None:

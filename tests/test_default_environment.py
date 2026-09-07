@@ -50,7 +50,6 @@ def test_falls_back_to_last_when_no_match():
 # `_resolve_default_environment` layers an `AXLE_DEFAULT_ENVIRONMENT`
 # override on top of `_default_environment`'s auto-pick.
 
-
 def test_resolve_falls_back_to_auto_pick_when_unset(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("AXLE_DEFAULT_ENVIRONMENT", raising=False)
     envs = [{"name": "lean-4.27.0"}, {"name": "lean-4.29.0"}]
