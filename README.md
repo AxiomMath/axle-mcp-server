@@ -85,14 +85,3 @@ Most tools are generated from the AXLE API's `/v1/endpoints` — `verify_proof`,
 | `list_environments` | List the available Lean environments. |
 | `share_url` | Turn a prior call's `request_id` into a permanent shareable webapp URL. |
 | `read_share_url` | Read back the inputs and result behind a share URL. |
-
-## Self-hosting
-
-```bash
-docker build -t axle-mcp .
-docker run -p 8080:8080 -e AXLE_MCP_TOKEN_SECRET="$(openssl rand -hex 32)" axle-mcp
-```
-
-`AXLE_MCP_TOKEN_SECRET` encrypts the sign-in tokens and must be the same on
-every instance. Set `AXLE_MCP_PUBLIC_URL` (e.g. `https://mcp.example.com`) if
-the server is not behind a proxy that sets `X-Forwarded-Proto`.
