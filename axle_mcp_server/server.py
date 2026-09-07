@@ -679,6 +679,7 @@ def _build_http_app() -> Any:
     from contextlib import asynccontextmanager
 
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+    from mcp.server.transport_security import RequestBodyLimitMiddleware
     from starlette.applications import Starlette
     from starlette.middleware import Middleware
     from starlette.middleware.cors import CORSMiddleware
@@ -739,7 +740,7 @@ def _build_http_app() -> Any:
         async with session_manager.run():
             yield
 
-    starlette_app = Starlette(
+    starlette_app: Any = Starlette(
         routes=[Route("/", health, methods=["GET"]), *auth.build_routes(provider)],
         lifespan=lifespan,
         # Browser-based OAuth clients (e.g. MCP Inspector) fetch discovery metadata and
@@ -753,6 +754,8 @@ def _build_http_app() -> Any:
             )
         ],
     )
+    # OAuth requests (registration JSON, token/login forms) are tiny; refuse anything big.
+    starlette_app = RequestBodyLimitMiddleware(starlette_app, 64 * 1024)
 
     async def reject_stream(send: Any) -> None:
         """405 the GET/SSE stream, which the spec allows in place of a stream.

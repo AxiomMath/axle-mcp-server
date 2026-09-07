@@ -487,3 +487,78 @@ async def test_login_get_with_bad_blob(app: Any) -> None:
     status, _, body = await _call(app, "GET", "/login")
     assert status == 400
     assert b"not valid" in body
+
+
+# --- hardening regressions ---------------------------------------------------------------
+
+
+def test_canonical_resource_never_raises() -> None:
+    assert auth.canonical_resource("https://host:notaport/mcp") == "https://host:notaport/mcp"
+    assert auth.canonical_resource("https://[::1/mcp") == "https://[::1/mcp"
+    assert isinstance(auth.canonical_resource(""), str)
+
+
+def test_prune_keeps_fresh_entries_under_flood() -> None:
+    cache: dict[str, tuple[float, Any]] = {"fresh": (10_000.0, True)}
+    for i in range(20):
+        cache[f"junk{i}"] = (10_000.0 + i, False)
+    auth._prune(cache, now=0.0, max_size=10)
+    assert "fresh" not in cache  # oldest dropped first ...
+    assert len(cache) == 9  # ... but the cache is never wiped wholesale
+    cache = {"expired": (0.0, True), "fresh": (10_000.0, True)}
+    auth._prune(cache, now=5.0, max_size=2)
+    assert list(cache) == ["fresh"]
+
+
+async def test_cimd_negative_cache(provider: auth.AxleOAuthProvider, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    def bad_fetch(u: str) -> Any:
+        calls.append(u)
+        raise ValueError("nope")
+
+    monkeypatch.setattr(auth, "fetch_client_metadata_document", bad_fetch)
+    url = "https://attacker.test/oauth/client.json"
+    assert await provider.get_client(url) is None
+    assert await provider.get_client(url) is None
+    assert calls == [url]
+
+
+def test_cimd_fetch_requires_https_and_refuses_redirects(monkeypatch: pytest.MonkeyPatch) -> None:
+    import http.server
+    import threading
+
+    with pytest.raises(ValueError, match="https"):
+        auth.fetch_client_metadata_document("http://claude.ai/oauth/x")
+
+    class Redirector(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            self.send_response(302)
+            self.send_header("Location", "http://127.0.0.1:1/internal")
+            self.end_headers()
+
+        def log_message(self, *a: Any) -> None:
+            pass
+
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), Redirector)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setattr(auth, "_assert_public_host", lambda host: None)
+        # Allow plain http only so the test can reach the redirect handling on a local socket.
+        monkeypatch.setattr(auth, "_CIMD_SCHEMES", ("https", "http"))
+        with pytest.raises(ValueError, match="redirect"):
+            auth.fetch_client_metadata_document(f"http://127.0.0.1:{httpd.server_port}/client.json")
+    finally:
+        httpd.shutdown()
+
+
+async def test_oversized_oauth_bodies_are_rejected(app: Any) -> None:
+    big = b"{" + b" " * (200 * 1024) + b"}"
+    status, _, _ = await _call(
+        app,
+        "POST",
+        "/register",
+        headers=[(b"content-type", b"application/json"), (b"content-length", str(len(big)).encode())],
+        body=big,
+    )
+    assert status == 413

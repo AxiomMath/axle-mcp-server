@@ -82,6 +82,7 @@ REFRESH_TOKEN_TTL: Final[int] = 90 * 24 * 60 * 60
 AUTH_CODE_TTL: Final[int] = 10 * 60
 LOGIN_REQUEST_TTL: Final[int] = 30 * 60
 CIMD_CACHE_TTL: Final[int] = 5 * 60
+CIMD_NEGATIVE_CACHE_TTL: Final[int] = 60
 RAW_KEY_OK_TTL: Final[int] = 5 * 60
 RAW_KEY_BAD_TTL: Final[int] = 60
 
@@ -130,16 +131,34 @@ def unbind_base_url(token: contextvars.Token[str]) -> None:
 
 
 def canonical_resource(url: str) -> str:
-    """RFC 8707 canonical form: lowercase scheme/host, no default port, no trailing slash."""
-    p = urllib.parse.urlsplit(url.strip())
+    """RFC 8707 canonical form: lowercase scheme/host, no default port, no trailing slash.
+
+    Never raises: a value that cannot be parsed (bad port, bad IPv6 literal) is
+    returned lowercased so that it simply fails to compare equal.
+    """
+    url = url.strip()
+    try:
+        p = urllib.parse.urlsplit(url)
+        port = p.port
+    except ValueError:
+        return url.lower().rstrip("/")
     scheme = p.scheme.lower()
     host = (p.hostname or "").lower()
     if ":" in host:
         host = f"[{host}]"
-    port = p.port
     if port and not ((scheme == "https" and port == 443) or (scheme == "http" and port == 80)):
         host = f"{host}:{port}"
     return f"{scheme}://{host}{p.path.rstrip('/')}"
+
+
+def _prune(cache: dict[str, tuple[float, Any]], now: float, max_size: int) -> None:
+    """Drop expired entries, then the oldest ones, so a flood cannot wipe the whole cache."""
+    if len(cache) < max_size:
+        return
+    for key in [k for k, (exp, _) in cache.items() if exp <= now]:
+        del cache[key]
+    while len(cache) >= max_size:
+        del cache[next(iter(cache))]
 
 
 _LOOPBACK_HOSTS: Final[frozenset[str]] = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -339,17 +358,37 @@ def _assert_public_host(hostname: str) -> None:
             raise ValueError(f"{hostname} resolves to a non-public address")
 
 
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """A redirect could point the fetch at an internal address after the host check."""
+
+    def redirect_request(
+        self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str
+    ) -> Any:
+        raise ValueError(
+            f"client metadata document redirected ({code}); redirects are not followed"
+        )
+
+
+_cimd_opener = urllib.request.build_opener(_NoRedirects)
+_CIMD_SCHEMES: tuple[str, ...] = ("https",)
+
+
 def fetch_client_metadata_document(url: str) -> Any:
-    """Blocking GET of a CIMD document with an SSRF guard and a size cap."""
+    """Blocking GET of a CIMD document with an SSRF guard, no redirects and a size cap."""
     parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in _CIMD_SCHEMES:
+        raise ValueError("client metadata document URL must be https")
     _assert_public_host(parsed.hostname or "")
     req = urllib.request.Request(
         url, headers={"Accept": "application/json", "User-Agent": _request_source()}
     )
-    with urllib.request.urlopen(req, timeout=5) as resp:
-        if resp.status != 200:
-            raise ValueError(f"client metadata document returned HTTP {resp.status}")
-        raw = resp.read(64 * 1024 + 1)
+    try:
+        with _cimd_opener.open(req, timeout=5) as resp:
+            if resp.status != 200:
+                raise ValueError(f"client metadata document returned HTTP {resp.status}")
+            raw = resp.read(64 * 1024 + 1)
+    except urllib.error.HTTPError as e:
+        raise ValueError(f"client metadata document returned HTTP {e.code}") from None
     if len(raw) > 64 * 1024:
         raise ValueError("client metadata document is too large")
     return json.loads(raw)
@@ -402,10 +441,14 @@ class AxleOAuthProvider:
     def __init__(self, codec: TokenCodec, axle_api_url: Callable[[], str]) -> None:
         self.codec = codec
         self.axle_api_url = axle_api_url
-        self._used_codes: dict[str, float] = {}
-        self._cimd_cache: dict[str, tuple[float, Client]] = {}
+        self._used_codes: dict[str, tuple[float, None]] = {}
+        # url -> (expiry, Client | None); None caches a rejected document so an attacker
+        # cannot make us re-fetch the same bad URL on every request.
+        self._cimd_cache: dict[str, tuple[float, Client | None]] = {}
         self._raw_key_cache: dict[str, tuple[float, bool]] = {}
         self._lock = threading.Lock()
+        # Bound concurrent outbound fetches triggered by unauthenticated callers.
+        self._fetch_limit = anyio.Semaphore(4)
 
     # -- clients ----------------------------------------------------------------
 
@@ -469,16 +512,18 @@ class AxleOAuthProvider:
             cached = self._cimd_cache.get(url)
         if cached and cached[0] > now:
             return cached[1]
+        client: Client | None
         try:
-            doc = await anyio.to_thread.run_sync(fetch_client_metadata_document, url)
+            async with self._fetch_limit:
+                doc = await anyio.to_thread.run_sync(fetch_client_metadata_document, url)
             client = client_from_cimd(url, doc)
         except (ValueError, OSError) as e:
             logger.warning("Rejected CIMD client %s: %s", url, e)
-            return None
+            client = None
         with self._lock:
-            if len(self._cimd_cache) > 1000:
-                self._cimd_cache.clear()
-            self._cimd_cache[url] = (now + CIMD_CACHE_TTL, client)
+            _prune(self._cimd_cache, now, 1000)
+            ttl = CIMD_CACHE_TTL if client is not None else CIMD_NEGATIVE_CACHE_TTL
+            self._cimd_cache[url] = (now + ttl, client)
         return client
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
@@ -544,11 +589,10 @@ class AxleOAuthProvider:
         """Best-effort single use of authorization codes (per process)."""
         now = time.time()
         with self._lock:
-            if len(self._used_codes) > 10000:
-                self._used_codes = {k: v for k, v in self._used_codes.items() if v > now}
+            _prune(self._used_codes, now, 10000)
             if jti in self._used_codes:
                 return False
-            self._used_codes[jti] = expires_at
+            self._used_codes[jti] = (expires_at, None)
             return True
 
     async def exchange_authorization_code(
@@ -670,8 +714,7 @@ class AxleOAuthProvider:
             logger.warning("Could not validate API key against AXLE: %s", e)
             return True
         with self._lock:
-            if len(self._raw_key_cache) > 10000:
-                self._raw_key_cache.clear()
+            _prune(self._raw_key_cache, now, 10000)
             self._raw_key_cache[digest] = (now + (RAW_KEY_OK_TTL if ok else RAW_KEY_BAD_TTL), ok)
         return ok
 
