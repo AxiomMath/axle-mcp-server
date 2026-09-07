@@ -1,24 +1,9 @@
-"""OAuth 2.1 for the hosted (streamable-HTTP) AXLE MCP server.
+"""OAuth 2.1 authorization server for HTTP mode.
 
-Browser-based MCP clients (Claude.ai, ChatGPT) have nowhere to type an API key: the only
-credential they can attach to a remote MCP server is an OAuth access token. So in HTTP
-mode this server is also its own OAuth 2.1 authorization server. The "sign in" step is a
-page that asks for the user's AXLE API key. The key is validated against AXLE and then
-sealed inside the tokens we issue; on each MCP request we unseal it and forward it
-upstream as `Authorization: Bearer <key>`.
-
-Everything is stateless. Client IDs (from dynamic registration), authorization codes,
-access tokens, refresh tokens and pending-login blobs are all encrypted + authenticated
-Fernet payloads keyed by AXLE_MCP_TOKEN_SECRET, so any instance can verify what any other
-instance issued and nothing needs a database.
-
-Client registration: Dynamic Client Registration (RFC 7591) and Client ID Metadata
-Documents (CIMD: an https URL as client_id). PKCE S256 is mandatory (the SDK's token
-handler enforces it).
-
-Raw AXLE API keys are also accepted as bearer tokens on /mcp, for clients that can set
-request headers (Claude Code, .mcp.json, Claude's org-admin "Request headers"). They are
-validated against AXLE before use.
+Claude.ai and ChatGPT can only attach an OAuth token to a remote MCP server, so /login
+asks for the user's AXLE API key and seals it into the tokens we issue; each MCP request
+unseals it and forwards it upstream. Every artifact (client id, code, tokens, pending
+login) is a Fernet blob keyed by AXLE_MCP_TOKEN_SECRET, so no state is stored anywhere.
 """
 
 from __future__ import annotations
@@ -66,6 +51,8 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
 
+from axle_mcp_server.server import VERSION
+
 logger = logging.getLogger(__name__)
 
 MCP_PATH: Final[str] = "/mcp"
@@ -89,24 +76,14 @@ RAW_KEY_UNAVAILABLE_TTL: Final[int] = 30
 
 DOCS_URL: Final[str] = "https://github.com/AxiomMath/axle-mcp-server"
 CONSOLE_URL: Final[str] = "https://axle.axiommath.ai/app/console"
+_USER_AGENT: Final[str] = f"axiom-axle-mcp/{VERSION}"
 
-# Public base URL of the current request (scheme://host), bound per request by the
-# ASGI wrapper so the provider can build absolute URLs without seeing the request.
-_current_base_url: contextvars.ContextVar[str] = contextvars.ContextVar("axle_mcp_base_url")
-
-
-# ---------------------------------------------------------------------------
-# URL helpers
-# ---------------------------------------------------------------------------
+# Bound per request by the ASGI wrapper; the SDK's authorize handler gives the provider
+# no request object, so this is how authorize() learns the public origin.
+current_base_url: contextvars.ContextVar[str] = contextvars.ContextVar("axle_mcp_base_url")
 
 
 def public_base_url(scope: Any) -> str:
-    """scheme://host this deployment is reached at.
-
-    AXLE_MCP_PUBLIC_URL wins when set (recommended in production). Otherwise derive it
-    from the proxy headers / Host of the current request, which is what Cloud Run and
-    local testing need.
-    """
     configured = os.environ.get("AXLE_MCP_PUBLIC_URL", "").strip()
     if configured:
         return configured.rstrip("/")
@@ -115,7 +92,7 @@ def public_base_url(scope: Any) -> str:
     }
     scheme = headers.get("x-forwarded-proto", scope.get("scheme") or "http")
     scheme = scheme.split(",", 1)[0].strip() or "http"
-    # Host is what the proxy (Cloud Run) validated; X-Forwarded-Host is not trusted.
+    # Host is set by the proxy; X-Forwarded-Host is client-controlled and not trusted.
     host = (headers.get("host") or "").split(",", 1)[0].strip()
     if not host:
         server = scope.get("server")
@@ -123,20 +100,8 @@ def public_base_url(scope: Any) -> str:
     return f"{scheme}://{host}"
 
 
-def bind_base_url(scope: Any) -> contextvars.Token[str]:
-    return _current_base_url.set(public_base_url(scope))
-
-
-def unbind_base_url(token: contextvars.Token[str]) -> None:
-    _current_base_url.reset(token)
-
-
 def canonical_resource(url: str) -> str:
-    """RFC 8707 canonical form: lowercase scheme/host, no default port, no trailing slash.
-
-    Never raises: a value that cannot be parsed (bad port, bad IPv6 literal) is
-    returned lowercased so that it simply fails to compare equal.
-    """
+    """RFC 8707 form: lowercase scheme/host, no default port, no trailing slash. Never raises."""
     url = url.strip()
     try:
         p = urllib.parse.urlsplit(url)
@@ -153,7 +118,7 @@ def canonical_resource(url: str) -> str:
 
 
 def _prune(cache: dict[str, tuple[float, Any]], now: float, max_size: int) -> None:
-    """Drop expired entries, then the oldest ones, so a flood cannot wipe the whole cache."""
+    # Expired first, then oldest: a flood of junk keys must not evict everything at once.
     if len(cache) < max_size:
         return
     for key in [k for k, (exp, _) in cache.items() if exp <= now]:
@@ -171,13 +136,9 @@ def is_loopback_redirect(url: str) -> bool:
 
 
 def redirect_uri_matches(registered: str, requested: str) -> bool:
-    """Exact match, except loopback redirects compare with the port ignored (RFC 8252 §7.3).
-
-    Native clients such as Claude Code register `http://localhost/callback` and bind an
-    ephemeral port at runtime.
-    """
     if registered == requested:
         return True
+    # RFC 8252 §7.3: native clients (Claude Code) bind an ephemeral loopback port.
     if not (is_loopback_redirect(registered) and is_loopback_redirect(requested)):
         return False
     a, b = urllib.parse.urlsplit(registered), urllib.parse.urlsplit(requested)
@@ -189,7 +150,6 @@ def redirect_uri_matches(registered: str, requested: str) -> bool:
 
 
 def check_redirect_uri_allowed(url: str) -> None:
-    """Reject redirect URIs we will never send a code to. Raises ValueError."""
     p = urllib.parse.urlsplit(url)
     if not p.scheme:
         raise ValueError(f"redirect URI has no scheme: {url}")
@@ -200,7 +160,6 @@ def check_redirect_uri_allowed(url: str) -> None:
 
 
 def append_query(url: str, **params: str | None) -> str:
-    """Add query parameters to a redirect URI, keeping its existing ones (even blank)."""
     parts = urllib.parse.urlsplit(url)
     query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
     query += [(k, v) for k, v in params.items() if v is not None]
@@ -212,17 +171,8 @@ def is_cimd_client_id(client_id: str) -> bool:
     return p.scheme == "https" and bool(p.netloc) and p.path not in ("", "/")
 
 
-# ---------------------------------------------------------------------------
-# Sealed tokens
-# ---------------------------------------------------------------------------
-
-
 class TokenCodec:
-    """Encrypt/authenticate small JSON payloads into opaque, prefixed strings.
-
-    Prefix format: `axmcp_<kind>_<fernet>`. The prefix lets the resource server tell
-    tokens it issued apart from raw AXLE API keys presented directly.
-    """
+    """Sealed JSON payloads as `axmcp_<kind>_<fernet>`; the prefix tells our tokens from raw keys."""
 
     PREFIX: Final[str] = "axmcp"
 
@@ -231,12 +181,10 @@ class TokenCodec:
         if not secret:
             secret = secrets.token_urlsafe(32)
             logger.warning(
-                "AXLE_MCP_TOKEN_SECRET is not set: using a random per-process secret. "
-                "Issued tokens will not survive a restart and will not be accepted by "
-                "other instances. Set AXLE_MCP_TOKEN_SECRET in production."
+                "AXLE_MCP_TOKEN_SECRET is not set: tokens will not survive a restart "
+                "or be accepted by other instances."
             )
-        key = base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest())
-        self._fernet = Fernet(key)
+        self._fernet = Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest()))
 
     def seal(self, kind: str, payload: dict[str, Any], ttl: int | None) -> str:
         body = dict(payload)
@@ -251,8 +199,7 @@ class TokenCodec:
         if not token.startswith(prefix):
             return None
         try:
-            raw = self._fernet.decrypt(token[len(prefix) :].encode())
-            payload = json.loads(raw)
+            payload = json.loads(self._fernet.decrypt(token[len(prefix) :].encode()))
         except (InvalidToken, ValueError):
             return None
         if not isinstance(payload, dict):
@@ -266,16 +213,8 @@ class TokenCodec:
         return token.startswith(f"{self.PREFIX}_")
 
 
-# ---------------------------------------------------------------------------
-# Clients
-# ---------------------------------------------------------------------------
-
-
 class Client(OAuthClientInformationFull):
-    """Registered OAuth client with MCP-friendly redirect and scope validation."""
-
     display_label: str = "an MCP client"
-    display_host: str | None = None
 
     def validate_redirect_uri(self, redirect_uri: AnyUrl | None) -> AnyUrl:
         registered = [str(u) for u in self.redirect_uris or []]
@@ -289,7 +228,7 @@ class Client(OAuthClientInformationFull):
         raise InvalidRedirectUriError(f"Redirect URI '{requested}' not registered for client")
 
     def validate_scope(self, requested_scope: str | None) -> list[str] | None:
-        # This server defines no scopes; whatever a client asks for is granted as-is.
+        # No scopes are defined; grant whatever was asked for.
         return requested_scope.split() if requested_scope else None
 
 
@@ -306,29 +245,15 @@ class AxleAccessToken(AccessToken):
     api_key: str
 
 
-# ---------------------------------------------------------------------------
-# Talking to AXLE
-# ---------------------------------------------------------------------------
-
-
 class AxleUnavailable(Exception):
-    """AXLE could not answer whether a key is valid."""
-
-
-def _request_source() -> str:
-    from axle_mcp_server import server as _srv
-
-    return f"axiom-axle-mcp/{_srv.VERSION}"
+    pass
 
 
 def verify_api_key(api_url: str, api_key: str) -> bool:
-    """Blocking. True/False if AXLE accepted/rejected the key; AxleUnavailable otherwise."""
+    """Blocking. Raises AxleUnavailable when AXLE could not say yes or no."""
     req = urllib.request.Request(
         f"{api_url}/v1/environments",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "X-Request-Source": _request_source(),
-        },
+        headers={"Authorization": f"Bearer {api_key}", "X-Request-Source": _USER_AGENT},
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -342,7 +267,7 @@ def verify_api_key(api_url: str, api_key: str) -> bool:
 
 
 def _api_key_is_wellformed(api_key: str) -> bool:
-    # Must be safe to place in an HTTP header.
+    # Must be safe to put in an HTTP header.
     return (
         0 < len(api_key) <= 512
         and api_key.isascii()
@@ -351,50 +276,35 @@ def _api_key_is_wellformed(api_key: str) -> bool:
     )
 
 
-# ---------------------------------------------------------------------------
-# CIMD (client_id is an https URL pointing at the client's metadata document)
-# ---------------------------------------------------------------------------
-
-
 def _assert_public_host(hostname: str) -> None:
     try:
         infos = socket.getaddrinfo(hostname, 443, proto=socket.IPPROTO_TCP)
     except socket.gaierror as e:
         raise ValueError(f"cannot resolve {hostname}: {e}") from None
     for info in infos:
-        addr = ipaddress.ip_address(info[4][0])
-        if not addr.is_global:
+        if not ipaddress.ip_address(info[4][0]).is_global:
             raise ValueError(f"{hostname} resolves to a non-public address")
 
 
 class _NoRedirects(urllib.request.HTTPRedirectHandler):
-    """A redirect could point the fetch at an internal address after the host check."""
-
+    # A redirect could point the fetch at an internal address after the host check.
     def redirect_request(
         self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str
     ) -> Any:
-        raise ValueError(
-            f"client metadata document redirected ({code}); redirects are not followed"
-        )
+        raise ValueError(f"client metadata document redirected ({code})")
 
 
 _cimd_opener = urllib.request.build_opener(_NoRedirects)
-_CIMD_SCHEMES: tuple[str, ...] = ("https",)
 
 
 def fetch_client_metadata_document(url: str) -> Any:
-    """Blocking GET of a CIMD document with an SSRF guard, no redirects and a size cap."""
-    parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme not in _CIMD_SCHEMES:
-        raise ValueError("client metadata document URL must be https")
-    _assert_public_host(parsed.hostname or "")
+    """Blocking GET of a CIMD document: public host only, no redirects, 64 KiB cap."""
+    _assert_public_host(urllib.parse.urlsplit(url).hostname or "")
     req = urllib.request.Request(
-        url, headers={"Accept": "application/json", "User-Agent": _request_source()}
+        url, headers={"Accept": "application/json", "User-Agent": _USER_AGENT}
     )
     try:
         with _cimd_opener.open(req, timeout=5) as resp:
-            if resp.status != 200:
-                raise ValueError(f"client metadata document returned HTTP {resp.status}")
             raw = resp.read(64 * 1024 + 1)
     except urllib.error.HTTPError as e:
         raise ValueError(f"client metadata document returned HTTP {e.code}") from None
@@ -415,54 +325,35 @@ def client_from_cimd(url: str, doc: Any) -> Client:
         if not isinstance(uri, str):
             raise ValueError("redirect_uris must be strings")
         check_redirect_uri_allowed(uri)
-    host = urllib.parse.urlsplit(url).hostname or url
     client_name = doc.get("client_name")
     return Client(
         client_id=url,
         redirect_uris=[AnyUrl(u) for u in redirect_uris],
-        # We only support public clients for CIMD; the metadata advertises `none`.
         token_endpoint_auth_method="none",
-        grant_types=["authorization_code", "refresh_token"],
-        response_types=["code"],
         client_name=client_name if isinstance(client_name, str) else None,
-        # Self-asserted documents: identify the client by where it is hosted.
-        display_label=host,
-        display_host=host,
+        # The document is self-asserted, so show where it is hosted rather than its name.
+        display_label=urllib.parse.urlsplit(url).hostname or url,
     )
-
-
-# ---------------------------------------------------------------------------
-# Provider
-# ---------------------------------------------------------------------------
 
 
 @dataclass
 class AuthFailure(Exception):
-    """Reject an MCP request with 401 (+ optional RFC 6750 error params)."""
-
     error: str | None = None
     description: str | None = None
 
 
 class AxleOAuthProvider:
-    """OAuthAuthorizationServerProvider whose 'user database' is AXLE's API keys."""
-
     def __init__(self, codec: TokenCodec, axle_api_url: Callable[[], str]) -> None:
         self.codec = codec
         self.axle_api_url = axle_api_url
         self._used_codes: dict[str, tuple[float, None]] = {}
-        # url -> (expiry, Client | None); None caches a rejected document so an attacker
-        # cannot make us re-fetch the same bad URL on every request.
         self._cimd_cache: dict[str, tuple[float, Client | None]] = {}
         self._raw_key_cache: dict[str, tuple[float, bool]] = {}
         self._lock = threading.Lock()
-        # Bound concurrent outbound fetches triggered by unauthenticated callers.
+        # /authorize is unauthenticated; cap the outbound fetches it can trigger.
         self._fetch_limit = anyio.Semaphore(4)
 
-    # -- clients ----------------------------------------------------------------
-
     def register(self, metadata: OAuthClientMetadata) -> dict[str, Any]:
-        """Dynamic client registration. Returns the RFC 7591 response body."""
         redirect_uris = [str(u) for u in metadata.redirect_uris or []]
         if not redirect_uris:
             raise ValueError("redirect_uris is required")
@@ -475,22 +366,20 @@ class AxleOAuthProvider:
             raise ValueError("grant_types must include authorization_code")
         if "code" not in metadata.response_types:
             raise ValueError("response_types must include code")
-        grant_types = sorted({*metadata.grant_types, "refresh_token"})
         secret = secrets.token_hex(32) if method != "none" else None
         record: dict[str, Any] = {
             "redirect_uris": redirect_uris,
             "token_endpoint_auth_method": method,
-            "grant_types": grant_types,
+            # We always issue refresh tokens, and the SDK checks the grant against this list.
+            "grant_types": sorted({*metadata.grant_types, "refresh_token"}),
             "response_types": metadata.response_types,
             "client_name": metadata.client_name,
-            "client_uri": str(metadata.client_uri) if metadata.client_uri else None,
             "scope": metadata.scope,
             "client_secret": secret,
             "client_id_issued_at": int(time.time()),
         }
-        client_id = self.codec.seal("c", record, ttl=None)
         response = {k: v for k, v in record.items() if k != "client_secret" and v is not None}
-        response["client_id"] = client_id
+        response["client_id"] = self.codec.seal("c", record, ttl=None)
         if secret is not None:
             response["client_secret"] = secret
             response["client_secret_expires_at"] = 0
@@ -500,29 +389,22 @@ class AxleOAuthProvider:
         record = self.codec.open("c", client_id)
         if record is not None:
             try:
-                return self._client_from_record(client_id, record)
+                return Client(
+                    client_id=client_id,
+                    client_secret=record.get("client_secret"),
+                    redirect_uris=[AnyUrl(u) for u in record["redirect_uris"]],
+                    token_endpoint_auth_method=record["token_endpoint_auth_method"],
+                    grant_types=record["grant_types"],
+                    response_types=record["response_types"],
+                    client_name=record.get("client_name"),
+                    scope=record.get("scope"),
+                    display_label=record.get("client_name") or "an MCP client",
+                )
             except (ValidationError, KeyError, ValueError):
                 return None
         if is_cimd_client_id(client_id):
             return await self._get_cimd_client(client_id)
         return None
-
-    @staticmethod
-    def _client_from_record(client_id: str, record: dict[str, Any]) -> Client:
-        host = urllib.parse.urlsplit(record.get("client_uri") or "").hostname
-        return Client(
-            client_id=client_id,
-            client_secret=record.get("client_secret"),
-            client_id_issued_at=record.get("client_id_issued_at"),
-            redirect_uris=[AnyUrl(u) for u in record["redirect_uris"]],
-            token_endpoint_auth_method=record["token_endpoint_auth_method"],
-            grant_types=record["grant_types"],
-            response_types=record["response_types"],
-            client_name=record.get("client_name"),
-            scope=record.get("scope"),
-            display_label=record.get("client_name") or "an MCP client",
-            display_host=host,
-        )
 
     async def _get_cimd_client(self, url: str) -> Client | None:
         now = time.time()
@@ -544,20 +426,19 @@ class AxleOAuthProvider:
             self._cimd_cache[url] = (now + ttl, client)
         return client
 
+    # Required by the SDK's provider protocol; nothing is stored, so nothing to do.
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
-        # Registration is handled by `register()` (stateless client IDs); nothing to store.
-        return None
+        pass
 
-    # -- authorization ------------------------------------------------------------
+    async def revoke_token(self, token: AxleAccessToken | AxleRefreshToken) -> None:
+        pass
 
     async def authorize(
         self, client: OAuthClientInformationFull, params: AuthorizationParams
     ) -> str:
-        """Send the browser to our login page, carrying the request in a sealed blob."""
         pending = {
             "client_id": client.client_id,
-            "client_label": getattr(client, "display_label", None) or "an MCP client",
-            "client_host": getattr(client, "display_host", None),
+            "client_label": getattr(client, "display_label", "an MCP client"),
             "redirect_uri": str(params.redirect_uri),
             "redirect_uri_provided_explicitly": params.redirect_uri_provided_explicitly,
             "state": params.state,
@@ -566,23 +447,19 @@ class AxleOAuthProvider:
             "resource": params.resource,
         }
         blob = self.codec.seal("lr", pending, LOGIN_REQUEST_TTL)
-        base = _current_base_url.get()
-        return f"{base}{LOGIN_PATH}?{urllib.parse.urlencode({'req': blob})}"
+        return f"{current_base_url.get()}{LOGIN_PATH}?{urllib.parse.urlencode({'req': blob})}"
 
     def issue_authorization_code(self, pending: dict[str, Any], api_key: str) -> str:
-        return self.codec.seal(
-            "ac",
-            {
-                "client_id": pending["client_id"],
-                "redirect_uri": pending["redirect_uri"],
-                "redirect_uri_provided_explicitly": pending["redirect_uri_provided_explicitly"],
-                "scopes": pending["scopes"],
-                "code_challenge": pending["code_challenge"],
-                "resource": pending.get("resource"),
-                "api_key": api_key,
-            },
-            AUTH_CODE_TTL,
+        keys = (
+            "client_id",
+            "redirect_uri",
+            "redirect_uri_provided_explicitly",
+            "scopes",
+            "code_challenge",
+            "resource",
         )
+        payload = {**{k: pending[k] for k in keys}, "api_key": api_key}
+        return self.codec.seal("ac", payload, AUTH_CODE_TTL)
 
     async def load_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: str
@@ -604,7 +481,7 @@ class AxleOAuthProvider:
         )
 
     def _consume_code(self, jti: str, expires_at: float) -> bool:
-        """Best-effort single use of authorization codes (per process)."""
+        # Single use is per process; PKCE covers replay across instances.
         now = time.time()
         with self._lock:
             _prune(self._used_codes, now, 10000)
@@ -646,9 +523,7 @@ class AxleOAuthProvider:
         refresh_token: AxleRefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
-        # A new refresh token is handed out on every refresh, but it inherits the original
-        # sign-in's expiry: tokens are stateless, so the chain cannot be revoked, and this
-        # caps it at REFRESH_TOKEN_TTL after the user last typed their key.
+        # Old refresh tokens cannot be revoked, so the new one keeps the original expiry.
         return self._issue_tokens(
             client_id=str(client.client_id),
             api_key=refresh_token.api_key,
@@ -669,10 +544,6 @@ class AxleOAuthProvider:
             resource=payload.get("resource"),
             api_key=payload["api_key"],
         )
-
-    async def revoke_token(self, token: AxleAccessToken | AxleRefreshToken) -> None:
-        # Stateless tokens cannot be revoked before they expire.
-        return None
 
     def _issue_tokens(
         self,
@@ -700,19 +571,13 @@ class AxleOAuthProvider:
             refresh_token=self.codec.seal("rt", common, refresh_ttl),
         )
 
-    # -- resource server ----------------------------------------------------------
-
     async def resolve_upstream_authorization(self, authorization: str | None, base_url: str) -> str:
-        """Turn the inbound Authorization header into the one to send to AXLE.
-
-        Raises AuthFailure when the request must be answered with 401.
-        """
+        """Map the inbound Authorization header to the one sent to AXLE, or raise AuthFailure."""
         if not authorization or not authorization.lower().startswith("bearer "):
             raise AuthFailure()
         token = authorization[7:].strip()
         if not token:
             raise AuthFailure()
-
         if self.codec.looks_issued(token):
             access = await self.load_access_token(token)
             if access is None:
@@ -721,8 +586,6 @@ class AxleOAuthProvider:
             if access.resource and canonical_resource(access.resource) != expected:
                 raise AuthFailure("invalid_token", "token was issued for a different resource")
             return f"Bearer {access.api_key}"
-
-        # A raw AXLE API key presented directly (Claude Code --header, .mcp.json, ...).
         if not _api_key_is_wellformed(token):
             raise AuthFailure("invalid_token", "malformed bearer token")
         if not await self._raw_key_accepted(token):
@@ -738,25 +601,15 @@ class AxleOAuthProvider:
             return cached[1]
         try:
             ok = await anyio.to_thread.run_sync(verify_api_key, self.axle_api_url(), api_key)
+            ttl = RAW_KEY_OK_TTL if ok else RAW_KEY_BAD_TTL
         except AxleUnavailable as e:
-            # Don't lock users out because AXLE hiccuped; the tool call itself will
-            # surface the upstream error. Remember the decision briefly so an outage
-            # does not cost a blocked thread per request.
+            # Fail open: the forwarded key still has to satisfy AXLE on the tool call.
             logger.warning("Could not validate API key against AXLE: %s", e)
-            ok = True
-            with self._lock:
-                _prune(self._raw_key_cache, now, 10000)
-                self._raw_key_cache[digest] = (now + RAW_KEY_UNAVAILABLE_TTL, True)
-            return ok
+            ok, ttl = True, RAW_KEY_UNAVAILABLE_TTL
         with self._lock:
             _prune(self._raw_key_cache, now, 10000)
-            self._raw_key_cache[digest] = (now + (RAW_KEY_OK_TTL if ok else RAW_KEY_BAD_TTL), ok)
+            self._raw_key_cache[digest] = (now + ttl, ok)
         return ok
-
-
-# ---------------------------------------------------------------------------
-# HTTP: metadata, 401s, login page, routes
-# ---------------------------------------------------------------------------
 
 
 def authorization_server_metadata(base: str) -> dict[str, Any]:
@@ -768,6 +621,7 @@ def authorization_server_metadata(base: str) -> dict[str, Any]:
         "response_types_supported": ["code"],
         "response_modes_supported": ["query"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
+        # Claude picks CIMD only if "none" is listed next to client_id_metadata_document_supported.
         "token_endpoint_auth_methods_supported": [
             "none",
             "client_secret_post",
@@ -832,7 +686,7 @@ input[type=password]{width:100%;padding:10px 12px;border:1px solid var(--line);b
 .row{display:flex;gap:10px;margin-top:16px;align-items:center}
 button{font:inherit;font-weight:600;padding:10px 16px;border-radius:8px;border:1px solid var(--accent);background:var(--accent);color:#fff;cursor:pointer}
 button.secondary{background:transparent;color:var(--fg);border-color:var(--line)}
-a{color:var(--accent)}code{font-size:13px}small{color:var(--muted)}
+a{color:var(--accent)}code{font-size:13px}
 """
 
 
@@ -848,19 +702,17 @@ def _page(title: str, body: str) -> str:
 
 def render_login_page(req_blob: str, pending: dict[str, Any], error: str | None = None) -> str:
     label = html.escape(str(pending.get("client_label") or "an MCP client"))
-    redirect_host = (
-        urllib.parse.urlsplit(pending["redirect_uri"]).hostname or pending["redirect_uri"]
+    redirect_host = html.escape(
+        str(urllib.parse.urlsplit(pending["redirect_uri"]).hostname or pending["redirect_uri"])
     )
-    redirect_host = html.escape(str(redirect_host))
     error_html = f'<p class="err">{html.escape(error)}</p>' if error else ""
     body = (
         "<h1>Connect AXLE</h1>"
         f"<p><strong>{label}</strong> wants to use AXLE (Axiom Lean Engine) on your behalf. "
         f"After you continue you will be sent back to <code>{redirect_host}</code>.</p>"
-        f"<p>Paste your AXLE API key. Create a free one in the "
-        f'<a href="{CONSOLE_URL}" target="_blank" rel="noopener">AXLE console</a>. '
-        "The key is verified with AXLE and stored only inside the encrypted token handed "
-        "back to the client; it is never shown to the AI model.</p>"
+        f'<p>Paste your AXLE API key (create one in the <a href="{CONSOLE_URL}" target="_blank" '
+        'rel="noopener">AXLE console</a>). It is verified with AXLE and stored only inside the '
+        "encrypted token handed to the client; the AI model never sees it.</p>"
         f"{error_html}"
         f'<form method="post" action="{LOGIN_PATH}" autocomplete="off">'
         f'<input type="hidden" name="req" value="{html.escape(req_blob)}">'
@@ -881,11 +733,10 @@ def render_error_page(message: str) -> str:
 
 
 def build_routes(provider: AxleOAuthProvider) -> list[Route]:
-    """Starlette routes for OAuth metadata, DCR, authorize/token and the login page."""
     authorization_handler = AuthorizationHandler(provider)
     token_handler = TokenHandler(provider, ClientAuthenticator(provider))
     no_store = {"Cache-Control": "no-store"}
-    # The login page takes a secret: never let it be framed, never leak the URL onwards.
+    # The login page takes a secret: never framed, never leaks its URL onwards.
     page_headers = {
         **no_store,
         "X-Frame-Options": "DENY",
@@ -896,6 +747,23 @@ def build_routes(provider: AxleOAuthProvider) -> list[Route]:
 
     def base_of(request: Request) -> str:
         return public_base_url(request.scope)
+
+    def expired_link() -> Response:
+        return HTMLResponse(
+            render_error_page(
+                "This sign-in link is missing, expired or was already used. Go back to "
+                "your AI client and start the connection again."
+            ),
+            status_code=400,
+            headers=page_headers,
+        )
+
+    def login_page(
+        blob: str, pending: dict[str, Any], error: str | None = None, status: int = 200
+    ) -> Response:
+        return HTMLResponse(
+            render_login_page(blob, pending, error), status_code=status, headers=page_headers
+        )
 
     async def as_metadata(request: Request) -> Response:
         return JSONResponse(
@@ -911,8 +779,7 @@ def build_routes(provider: AxleOAuthProvider) -> list[Route]:
 
     async def register(request: Request) -> Response:
         try:
-            body = await request.json()
-            metadata = OAuthClientMetadata.model_validate(body)
+            metadata = OAuthClientMetadata.model_validate(await request.json())
         except (ValidationError, ValueError) as e:
             return JSONResponse(
                 {"error": "invalid_client_metadata", "error_description": str(e)[:500]},
@@ -928,30 +795,14 @@ def build_routes(provider: AxleOAuthProvider) -> list[Route]:
     async def login_get(request: Request) -> Response:
         blob = request.query_params.get("req") or ""
         pending = provider.codec.open("lr", blob)
-        if pending is None:
-            return HTMLResponse(
-                render_error_page(
-                    "This sign-in link is missing, expired or was already used. Go back to "
-                    "your AI client and start the connection again."
-                ),
-                status_code=400,
-                headers=page_headers,
-            )
-        return HTMLResponse(render_login_page(blob, pending), headers=page_headers)
+        return expired_link() if pending is None else login_page(blob, pending)
 
     async def login_post(request: Request) -> Response:
         form = await request.form()
         blob = str(form.get("req") or "")
         pending = provider.codec.open("lr", blob)
         if pending is None:
-            return HTMLResponse(
-                render_error_page(
-                    "This sign-in link is missing, expired or was already used. Go back to "
-                    "your AI client and start the connection again."
-                ),
-                status_code=400,
-                headers=page_headers,
-            )
+            return expired_link()
         redirect_uri = pending["redirect_uri"]
         state = pending.get("state")
         if form.get("action") == "deny":
@@ -967,33 +818,23 @@ def build_routes(provider: AxleOAuthProvider) -> list[Route]:
             )
         api_key = str(form.get("api_key") or "").strip()
         if not _api_key_is_wellformed(api_key):
-            return HTMLResponse(
-                render_login_page(blob, pending, "Please paste a valid AXLE API key."),
-                status_code=400,
-                headers=page_headers,
-            )
+            return login_page(blob, pending, "Please paste a valid AXLE API key.", 400)
         try:
             ok = await anyio.to_thread.run_sync(verify_api_key, provider.axle_api_url(), api_key)
         except AxleUnavailable as e:
             logger.warning("Login: AXLE unavailable while verifying key: %s", e)
-            return HTMLResponse(
-                render_login_page(
-                    blob,
-                    pending,
-                    "AXLE could not be reached to verify the key. Try again in a moment.",
-                ),
-                status_code=502,
-                headers=page_headers,
+            return login_page(
+                blob,
+                pending,
+                "AXLE could not be reached to verify the key. Try again in a moment.",
+                502,
             )
         if not ok:
-            return HTMLResponse(
-                render_login_page(
-                    blob,
-                    pending,
-                    "AXLE rejected this API key. Check it in the console and try again.",
-                ),
-                status_code=400,
-                headers=page_headers,
+            return login_page(
+                blob,
+                pending,
+                "AXLE rejected this API key. Check it in the console and try again.",
+                400,
             )
         code = provider.issue_authorization_code(pending, api_key)
         return RedirectResponse(

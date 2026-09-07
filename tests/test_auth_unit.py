@@ -514,7 +514,6 @@ async def test_health_reports_auth(app: Any) -> None:
     doc = json.loads(body)
     assert doc["auth"] == "oauth"
     assert doc["token_secret"] == "configured"
-    assert doc["resource_metadata"].endswith("/.well-known/oauth-protected-resource/mcp")
 
 
 async def test_login_get_with_bad_blob(app: Any) -> None:
@@ -560,12 +559,9 @@ async def test_cimd_negative_cache(
     assert calls == [url]
 
 
-def test_cimd_fetch_requires_https_and_refuses_redirects(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cimd_fetch_refuses_redirects(monkeypatch: pytest.MonkeyPatch) -> None:
     import http.server
     import threading
-
-    with pytest.raises(ValueError, match="https"):
-        auth.fetch_client_metadata_document("http://claude.ai/oauth/x")
 
     class Redirector(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
@@ -580,8 +576,6 @@ def test_cimd_fetch_requires_https_and_refuses_redirects(monkeypatch: pytest.Mon
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
         monkeypatch.setattr(auth, "_assert_public_host", lambda host: None)
-        # Allow plain http only so the test can reach the redirect handling on a local socket.
-        monkeypatch.setattr(auth, "_CIMD_SCHEMES", ("https", "http"))
         with pytest.raises(ValueError, match="redirect"):
             auth.fetch_client_metadata_document(f"http://127.0.0.1:{httpd.server_port}/client.json")
     finally:

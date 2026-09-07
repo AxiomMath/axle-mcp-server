@@ -380,11 +380,8 @@ def build_input_schema(
     return schema
 
 
-# ChatGPT treats tools without readOnlyHint as write actions and asks the user to
-# confirm every call. AXLE tools are pure computations over the Lean code they're given.
-_READ_ONLY: Final[types.ToolAnnotations] = types.ToolAnnotations(
-    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
-)
+# ChatGPT treats tools without readOnlyHint as write actions and confirms every call.
+_READ_ONLY: Final[types.ToolAnnotations] = types.ToolAnnotations(readOnlyHint=True)
 
 
 def _build_tool_defs(
@@ -465,9 +462,7 @@ def _build_tool_defs(
                 },
                 "required": ["request_id"],
             },
-            annotations=types.ToolAnnotations(
-                readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False
-            ),
+            annotations=types.ToolAnnotations(readOnlyHint=False, destructiveHint=False),
         )
     )
     tools.append(
@@ -557,14 +552,15 @@ def _extract_request_id(share_url: str) -> str | None:
     m = _UUID_RE.search(share_url)
     return m.group(0) if m else None
 
-SERVER_INSTRUCTIONS: Final[str] = (
-    "AXLE (Axiom Lean Engine) checks and manipulates Lean 4 code. Use verify_proof to "
-    "check a candidate proof against a sorried theorem statement, check to compile any "
-    "Lean source and collect messages, and read_docs before non-trivial use. Every tool "
-    "is read-only apart from share_url, which creates a shareable link."
+server = Server(
+    "axle",
+    version=VERSION,
+    instructions=(
+        "AXLE (Axiom Lean Engine) checks and manipulates Lean 4 code. Use verify_proof to "
+        "check a candidate proof against a sorried theorem statement, check to compile any "
+        "Lean source and collect messages, and read_docs before non-trivial use."
+    ),
 )
-
-server = Server("axle", version=VERSION, instructions=SERVER_INSTRUCTIONS)
 
 
 @server.list_tools()
@@ -666,16 +662,7 @@ def _extract_request_context(scope: Any) -> tuple[str | None, str | None]:
 
 
 def _build_http_app() -> Any:
-    """Construct the ASGI app that serves MCP over streamable HTTP.
-
-    Routes:
-      POST /mcp                  MCP endpoint. Requires `Authorization: Bearer <token>`
-                                 where <token> is either an access token issued by this
-                                 server's OAuth flow or a raw AXLE API key.
-      GET  /.well-known/...      OAuth discovery (RFC 9728 + RFC 8414).
-      /authorize /token /register /login   OAuth 2.1 authorization server (see auth.py).
-      GET  /                     Health.
-    """
+    """ASGI app: /mcp behind OAuth (see auth.py), the OAuth endpoints, and / health."""
     from contextlib import asynccontextmanager
 
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
@@ -695,9 +682,8 @@ def _build_http_app() -> Any:
         stateless=True,
     )
     codec = auth.TokenCodec(os.environ.get("AXLE_MCP_TOKEN_SECRET"))
-    # Read AXLE_API_URL lazily so tests (and the login page) follow the live value.
     provider = auth.AxleOAuthProvider(codec, axle_api_url=lambda: AXLE_API_URL)
-    allow_anonymous = os.environ.get("AXLE_MCP_ALLOW_ANONYMOUS", "").lower() in ("1", "true", "yes")
+    allow_anonymous = os.environ.get("AXLE_MCP_ALLOW_ANONYMOUS") == "1"
 
     cors_headers = [
         (b"access-control-allow-origin", b"*"),
@@ -705,8 +691,6 @@ def _build_http_app() -> Any:
     ]
 
     def with_cors(send: Any) -> Any:
-        """Add permissive CORS headers so browser-based MCP clients can call /mcp."""
-
         async def _send(message: dict[str, Any]) -> None:
             if message.get("type") == "http.response.start":
                 message = {**message, "headers": [*message.get("headers", []), *cors_headers]}
@@ -749,17 +733,14 @@ def _build_http_app() -> Any:
             _request_authorization.reset(auth_token)
             _request_client_ip.reset(ip_token)
 
-    async def health(request: Request) -> JSONResponse:
-        base = auth.public_base_url(request.scope)
+    async def health(_request: Request) -> JSONResponse:
         return JSONResponse(
             {
                 "service": "axle-mcp-server",
                 "version": VERSION,
                 "upstream": AXLE_API_URL,
                 "mcp_endpoint": "/mcp",
-                "auth": "oauth" if not allow_anonymous else "oauth-or-anonymous",
-                "resource_metadata": f"{base}{auth.PRM_MCP_PATH}",
-                "authorization_server_metadata": f"{base}{auth.AS_METADATA_PATH}",
+                "auth": "oauth-or-anonymous" if allow_anonymous else "oauth",
                 "token_secret": "ephemeral" if codec.ephemeral else "configured",
             }
         )
@@ -772,8 +753,7 @@ def _build_http_app() -> Any:
     starlette_app: Any = Starlette(
         routes=[Route("/", health, methods=["GET"]), *auth.build_routes(provider)],
         lifespan=lifespan,
-        # Browser-based OAuth clients (e.g. MCP Inspector) fetch discovery metadata and
-        # call /token and /register cross-origin.
+        # Browser-based clients (MCP Inspector) call the OAuth endpoints cross-origin.
         middleware=[
             Middleware(
                 CORSMiddleware,
@@ -783,7 +763,6 @@ def _build_http_app() -> Any:
             )
         ],
     )
-    # OAuth requests (registration JSON, token/login forms) are tiny; refuse anything big.
     starlette_app = RequestBodyLimitMiddleware(starlette_app, 64 * 1024)
 
     async def reject_stream(send: Any) -> None:
@@ -809,7 +788,7 @@ def _build_http_app() -> Any:
         if scope.get("type") != "http":
             await starlette_app(scope, receive, send)
             return
-        base_token = auth.bind_base_url(scope)
+        base_token = auth.current_base_url.set(auth.public_base_url(scope))
         try:
             if scope.get("path") in ("/mcp", "/mcp/"):
                 if scope.get("method") == "OPTIONS":
@@ -822,7 +801,7 @@ def _build_http_app() -> Any:
                 return
             await starlette_app(scope, receive, send)
         finally:
-            auth.unbind_base_url(base_token)
+            auth.current_base_url.reset(base_token)
 
     return app
 
@@ -831,8 +810,7 @@ def _http_main(host: str, port: int) -> None:
     import uvicorn
 
     app = _build_http_app()
-    # Behind Cloud Run / any TLS-terminating proxy the public scheme+host arrive in
-    # X-Forwarded-* headers; trust them so OAuth metadata advertises https URLs.
+    # Trust X-Forwarded-Proto from the TLS-terminating proxy so metadata advertises https.
     uvicorn.run(
         app, host=host, port=port, log_level="info", proxy_headers=True, forwarded_allow_ips="*"
     )
