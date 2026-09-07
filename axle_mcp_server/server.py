@@ -380,6 +380,13 @@ def build_input_schema(
     return schema
 
 
+# ChatGPT treats tools without readOnlyHint as write actions and asks the user to
+# confirm every call. AXLE tools are pure computations over the Lean code they're given.
+_READ_ONLY: Final[types.ToolAnnotations] = types.ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
+
+
 def _build_tool_defs(
     endpoints: dict[str, Any], default_environment: str
 ) -> list[types.Tool]:
@@ -394,6 +401,7 @@ def _build_tool_defs(
                 name=name,
                 description=meta.get("description", name),
                 inputSchema=schema,
+                annotations=_READ_ONLY,
             )
         )
     tools.append(
@@ -419,6 +427,7 @@ def _build_tool_defs(
                     },
                 },
             },
+            annotations=_READ_ONLY,
         )
     )
     tools.append(
@@ -426,6 +435,7 @@ def _build_tool_defs(
             name="list_environments",
             description="List available Lean environments on the AXLE server.",
             inputSchema={"type": "object", "properties": {}},
+            annotations=_READ_ONLY,
         )
     )
     tools.append(
@@ -455,6 +465,9 @@ def _build_tool_defs(
                 },
                 "required": ["request_id"],
             },
+            annotations=types.ToolAnnotations(
+                readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False
+            ),
         )
     )
     tools.append(
@@ -479,6 +492,7 @@ def _build_tool_defs(
                 },
                 "required": ["share_url"],
             },
+            annotations=_READ_ONLY,
         )
     )
     return tools
@@ -497,7 +511,7 @@ def _default_environment(environments: list[dict[str, Any]]) -> str:
                 best_version = version
                 best_name = env["name"]
     if best_name is None:
-        return environments[-1]["name"]
+        return str(environments[-1]["name"])
     return best_name
 
 
@@ -543,7 +557,14 @@ def _extract_request_id(share_url: str) -> str | None:
     m = _UUID_RE.search(share_url)
     return m.group(0) if m else None
 
-server = Server("axle")
+SERVER_INSTRUCTIONS: Final[str] = (
+    "AXLE (Axiom Lean Engine) checks and manipulates Lean 4 code. Use verify_proof to "
+    "check a candidate proof against a sorried theorem statement, check to compile any "
+    "Lean source and collect messages, and read_docs before non-trivial use. Every tool "
+    "is read-only apart from share_url, which creates a shareable link."
+)
+
+server = Server("axle", version=VERSION, instructions=SERVER_INSTRUCTIONS)
 
 
 @server.list_tools()
@@ -645,24 +666,52 @@ def _extract_request_context(scope: Any) -> tuple[str | None, str | None]:
 
 
 def _build_http_app() -> Any:
-    """Construct the Starlette ASGI app that serves MCP over streamable HTTP."""
+    """Construct the ASGI app that serves MCP over streamable HTTP.
+
+    Routes:
+      POST /mcp                  MCP endpoint. Requires `Authorization: Bearer <token>`
+                                 where <token> is either an access token issued by this
+                                 server's OAuth flow or a raw AXLE API key.
+      GET  /.well-known/...      OAuth discovery (RFC 9728 + RFC 8414).
+      /authorize /token /register /login   OAuth 2.1 authorization server (see auth.py).
+      GET  /                     Health.
+    """
     from contextlib import asynccontextmanager
 
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
     from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.middleware.cors import CORSMiddleware
     from starlette.requests import Request
     from starlette.responses import JSONResponse
     from starlette.routing import Route
+
+    from . import auth
 
     session_manager = StreamableHTTPSessionManager(
         app=server,
         event_store=None,
         stateless=True,
     )
+    codec = auth.TokenCodec(os.environ.get("AXLE_MCP_TOKEN_SECRET"))
+    # Read AXLE_API_URL lazily so tests (and the login page) follow the live value.
+    provider = auth.AxleOAuthProvider(codec, axle_api_url=lambda: AXLE_API_URL)
+    allow_anonymous = os.environ.get("AXLE_MCP_ALLOW_ANONYMOUS", "").lower() in ("1", "true", "yes")
 
     async def handle_mcp(scope: Any, receive: Any, send: Any) -> None:
         authorization, client_ip = _extract_request_context(scope)
-        auth_token = _request_authorization.set(authorization)
+        base_url = auth.public_base_url(scope)
+        if authorization is None and allow_anonymous:
+            upstream_authorization: str | None = None
+        else:
+            try:
+                upstream_authorization = await provider.resolve_upstream_authorization(
+                    authorization, base_url
+                )
+            except auth.AuthFailure as failure:
+                await auth.send_unauthorized(send, base_url, failure)
+                return
+        auth_token = _request_authorization.set(upstream_authorization)
         ip_token = _request_client_ip.set(client_ip)
         try:
             await session_manager.handle_request(scope, receive, send)
@@ -670,13 +719,18 @@ def _build_http_app() -> Any:
             _request_authorization.reset(auth_token)
             _request_client_ip.reset(ip_token)
 
-    async def health(_request: Request) -> JSONResponse:
+    async def health(request: Request) -> JSONResponse:
+        base = auth.public_base_url(request.scope)
         return JSONResponse(
             {
                 "service": "axle-mcp-server",
                 "version": VERSION,
                 "upstream": AXLE_API_URL,
                 "mcp_endpoint": "/mcp",
+                "auth": "oauth" if not allow_anonymous else "oauth-or-anonymous",
+                "resource_metadata": f"{base}{auth.PRM_MCP_PATH}",
+                "authorization_server_metadata": f"{base}{auth.AS_METADATA_PATH}",
+                "token_secret": "ephemeral" if codec.ephemeral else "configured",
             }
         )
 
@@ -686,8 +740,18 @@ def _build_http_app() -> Any:
             yield
 
     starlette_app = Starlette(
-        routes=[Route("/", health, methods=["GET"])],
+        routes=[Route("/", health, methods=["GET"]), *auth.build_routes(provider)],
         lifespan=lifespan,
+        # Browser-based OAuth clients (e.g. MCP Inspector) fetch discovery metadata and
+        # call /token and /register cross-origin.
+        middleware=[
+            Middleware(
+                CORSMiddleware,
+                allow_origins=["*"],
+                allow_methods=["GET", "POST", "OPTIONS"],
+                allow_headers=["Authorization", "Content-Type", "Mcp-Protocol-Version"],
+            )
+        ],
     )
 
     async def reject_stream(send: Any) -> None:
@@ -710,13 +774,20 @@ def _build_http_app() -> Any:
     # MCP handler. Skipping Starlette's Mount avoids a 307 redirect on /mcp
     # that Claude's web connector doesn't follow on POST.
     async def app(scope: Any, receive: Any, send: Any) -> None:
-        if scope.get("type") == "http" and scope.get("path") in ("/mcp", "/mcp/"):
-            if scope.get("method") in ("GET", "HEAD"):
-                await reject_stream(send)
-                return
-            await handle_mcp(scope, receive, send)
+        if scope.get("type") != "http":
+            await starlette_app(scope, receive, send)
             return
-        await starlette_app(scope, receive, send)
+        base_token = auth.bind_base_url(scope)
+        try:
+            if scope.get("path") in ("/mcp", "/mcp/"):
+                if scope.get("method") in ("GET", "HEAD"):
+                    await reject_stream(send)
+                    return
+                await handle_mcp(scope, receive, send)
+                return
+            await starlette_app(scope, receive, send)
+        finally:
+            auth.unbind_base_url(base_token)
 
     return app
 
@@ -725,7 +796,11 @@ def _http_main(host: str, port: int) -> None:
     import uvicorn
 
     app = _build_http_app()
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    # Behind Cloud Run / any TLS-terminating proxy the public scheme+host arrive in
+    # X-Forwarded-* headers; trust them so OAuth metadata advertises https URLs.
+    uvicorn.run(
+        app, host=host, port=port, log_level="info", proxy_headers=True, forwarded_allow_ips="*"
+    )
 
 
 def main() -> None:
