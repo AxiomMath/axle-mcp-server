@@ -74,7 +74,6 @@ RAW_KEY_OK_TTL: Final[int] = 5 * 60
 RAW_KEY_BAD_TTL: Final[int] = 60
 RAW_KEY_UNAVAILABLE_TTL: Final[int] = 30
 
-DOCS_URL: Final[str] = "https://github.com/AxiomMath/axle-mcp-server"
 CONSOLE_URL: Final[str] = "https://axle.axiommath.ai/app/console"
 _USER_AGENT: Final[str] = f"axiom-axle-mcp/{VERSION}"
 
@@ -619,7 +618,6 @@ def authorization_server_metadata(base: str) -> dict[str, Any]:
         "token_endpoint": f"{base}{TOKEN_PATH}",
         "registration_endpoint": f"{base}{REGISTRATION_PATH}",
         "response_types_supported": ["code"],
-        "response_modes_supported": ["query"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         # Claude picks CIMD only if "none" is listed next to client_id_metadata_document_supported.
         "token_endpoint_auth_methods_supported": [
@@ -630,7 +628,6 @@ def authorization_server_metadata(base: str) -> dict[str, Any]:
         "code_challenge_methods_supported": ["S256"],
         "client_id_metadata_document_supported": True,
         "authorization_response_iss_parameter_supported": True,
-        "service_documentation": DOCS_URL,
     }
 
 
@@ -639,8 +636,6 @@ def protected_resource_metadata(base: str) -> dict[str, Any]:
         "resource": f"{base}{MCP_PATH}",
         "authorization_servers": [base],
         "bearer_methods_supported": ["header"],
-        "resource_name": "AXLE MCP server",
-        "resource_documentation": DOCS_URL,
     }
 
 
@@ -711,8 +706,7 @@ def render_login_page(req_blob: str, pending: dict[str, Any], error: str | None 
         f"<p><strong>{label}</strong> wants to use AXLE (Axiom Lean Engine) on your behalf. "
         f"After you continue you will be sent back to <code>{redirect_host}</code>.</p>"
         f'<p>Paste your AXLE API key (create one in the <a href="{CONSOLE_URL}" target="_blank" '
-        'rel="noopener">AXLE console</a>). It is verified with AXLE and stored only inside the '
-        "encrypted token handed to the client; the AI model never sees it.</p>"
+        'rel="noopener">AXLE console</a>). The AI model never sees it.</p>'
         f"{error_html}"
         f'<form method="post" action="{LOGIN_PATH}" autocomplete="off">'
         f'<input type="hidden" name="req" value="{html.escape(req_blob)}">'
@@ -729,7 +723,7 @@ def render_login_page(req_blob: str, pending: dict[str, Any], error: str | None 
 
 
 def render_error_page(message: str) -> str:
-    return _page("AXLE sign-in", f"<h1>Sign-in link is not valid</h1><p>{html.escape(message)}</p>")
+    return _page("Connect AXLE", f"<h1>Sign-in link is not valid</h1><p>{html.escape(message)}</p>")
 
 
 def build_routes(provider: AxleOAuthProvider) -> list[Route]:
@@ -751,8 +745,7 @@ def build_routes(provider: AxleOAuthProvider) -> list[Route]:
     def expired_link() -> Response:
         return HTMLResponse(
             render_error_page(
-                "This sign-in link is missing, expired or was already used. Go back to "
-                "your AI client and start the connection again."
+                "This sign-in link has expired. Start the connection again from your AI client."
             ),
             status_code=400,
             headers=page_headers,
@@ -826,14 +819,14 @@ def build_routes(provider: AxleOAuthProvider) -> list[Route]:
             return login_page(
                 blob,
                 pending,
-                "AXLE could not be reached to verify the key. Try again in a moment.",
+                "AXLE could not be reached. Try again in a moment.",
                 502,
             )
         if not ok:
             return login_page(
                 blob,
                 pending,
-                "AXLE rejected this API key. Check it in the console and try again.",
+                "AXLE rejected this API key.",
                 400,
             )
         code = provider.issue_authorization_code(pending, api_key)

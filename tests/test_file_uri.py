@@ -85,9 +85,7 @@ async def test_rejects_both_content_and_file_uri(tmp_path: pathlib.Path) -> None
     f = tmp_path / "p.lean"
     f.write_text("y")
     with pytest.raises(ValueError, match="exactly one"):
-        await handle_call_tool(
-            "check", {"content": "x", "file_uri": f.as_uri()}
-        )
+        await handle_call_tool("check", {"content": "x", "file_uri": f.as_uri()})
 
 
 async def test_rejects_neither_content_nor_file_uri() -> None:
@@ -97,9 +95,7 @@ async def test_rejects_neither_content_nor_file_uri() -> None:
 
 async def test_rejects_missing_file() -> None:
     with pytest.raises(ValueError, match="regular file"):
-        await handle_call_tool(
-            "check", {"file_uri": "file:///definitely/does/not/exist.lean"}
-        )
+        await handle_call_tool("check", {"file_uri": "file:///definitely/does/not/exist.lean"})
 
 
 async def test_rejects_directory(tmp_path: pathlib.Path) -> None:
@@ -135,10 +131,13 @@ async def test_accepts_file_inside_declared_roots(
     f = tmp_path / "p.lean"
     f.write_text("ok")
     mock = AsyncMock(return_value={"okay": True})
-    with patch(
-        "axle_mcp_server.server._client_roots",
-        AsyncMock(return_value=[tmp_path.resolve()]),
-    ), patch("axle_mcp_server.server._call_endpoint", mock):
+    with (
+        patch(
+            "axle_mcp_server.server._client_roots",
+            AsyncMock(return_value=[tmp_path.resolve()]),
+        ),
+        patch("axle_mcp_server.server._call_endpoint", mock),
+    ):
         await handle_call_tool("check", {"file_uri": f.as_uri()})
 
     assert mock.call_args[0][1]["content"] == "ok"
@@ -147,9 +146,7 @@ async def test_accepts_file_inside_declared_roots(
 async def test_empty_roots_list_denies_all(tmp_path: pathlib.Path) -> None:
     f = tmp_path / "p.lean"
     f.write_text("x")
-    with patch(
-        "axle_mcp_server.server._client_roots", AsyncMock(return_value=[])
-    ):
+    with patch("axle_mcp_server.server._client_roots", AsyncMock(return_value=[])):
         with pytest.raises(ValueError, match="outside.*roots"):
             await handle_call_tool("check", {"file_uri": f.as_uri()})
 

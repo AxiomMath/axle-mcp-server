@@ -28,9 +28,6 @@ def provider(codec: auth.TokenCodec) -> auth.AxleOAuthProvider:
     return auth.AxleOAuthProvider(codec, axle_api_url=lambda: "https://axle.invalid")
 
 
-# --- sealed tokens -------------------------------------------------------------
-
-
 def test_codec_roundtrip_and_prefix(codec: auth.TokenCodec) -> None:
     tok = codec.seal("at", {"api_key": "k"}, ttl=60)
     assert tok.startswith("axmcp_at_")
@@ -54,9 +51,6 @@ def test_codec_ephemeral_secret_warns(caplog: pytest.LogCaptureFixture) -> None:
     c = auth.TokenCodec(None)
     assert c.ephemeral
     assert "AXLE_MCP_TOKEN_SECRET" in caplog.text
-
-
-# --- URL helpers ---------------------------------------------------------------
 
 
 def test_canonical_resource() -> None:
@@ -124,9 +118,6 @@ def test_public_base_url_env_and_headers(monkeypatch: pytest.MonkeyPatch) -> Non
     )
     monkeypatch.setenv("AXLE_MCP_PUBLIC_URL", "https://configured.test/")
     assert auth.public_base_url(scope) == "https://configured.test"
-
-
-# --- clients -------------------------------------------------------------------
 
 
 async def test_dcr_public_client_roundtrip(provider: auth.AxleOAuthProvider) -> None:
@@ -247,9 +238,6 @@ async def test_cimd_rejects_mismatched_document(
     assert await provider.get_client(url) is None
 
 
-# --- tokens & resource-server gate ---------------------------------------------------
-
-
 async def test_issued_token_resolves_to_api_key(provider: auth.AxleOAuthProvider) -> None:
     tokens = provider._issue_tokens(
         client_id="c", api_key="sk-user", scopes=[], resource=f"{BASE}/mcp"
@@ -340,9 +328,6 @@ async def test_authorization_code_single_use(provider: auth.AxleOAuthProvider) -
         await provider.exchange_authorization_code(client, loaded)
 
 
-# --- metadata & 401 shape -------------------------------------------------------------
-
-
 def test_metadata_documents() -> None:
     m = auth.authorization_server_metadata(BASE)
     assert m["issuer"] == BASE
@@ -381,9 +366,6 @@ async def test_login_page_renders_client_and_redirect_host(codec: auth.TokenCode
     assert 'name="req" value="blob"' in page
     assert auth.CONSOLE_URL in page
     assert "AXLE rejected" in auth.render_login_page("blob", pending, "AXLE rejected this API key.")
-
-
-# --- ASGI app: /mcp gate + discovery -------------------------------------------------
 
 
 async def _call(
@@ -512,7 +494,6 @@ async def test_health_reports_auth(app: Any) -> None:
     status, _, body = await _call(app, "GET", "/")
     assert status == 200
     doc = json.loads(body)
-    assert doc["auth"] == "oauth"
     assert doc["token_secret"] == "configured"
 
 
@@ -520,9 +501,6 @@ async def test_login_get_with_bad_blob(app: Any) -> None:
     status, _, body = await _call(app, "GET", "/login")
     assert status == 400
     assert b"not valid" in body
-
-
-# --- hardening regressions ---------------------------------------------------------------
 
 
 def test_canonical_resource_never_raises() -> None:
@@ -595,9 +573,6 @@ async def test_oversized_oauth_bodies_are_rejected(app: Any) -> None:
         body=big,
     )
     assert status == 413
-
-
-# --- second review pass ------------------------------------------------------------------
 
 
 def test_append_query_keeps_blank_and_existing_params() -> None:

@@ -740,7 +740,6 @@ def _build_http_app() -> Any:
                 "version": VERSION,
                 "upstream": AXLE_API_URL,
                 "mcp_endpoint": "/mcp",
-                "auth": "oauth-or-anonymous" if allow_anonymous else "oauth",
                 "token_secret": "ephemeral" if codec.ephemeral else "configured",
             }
         )

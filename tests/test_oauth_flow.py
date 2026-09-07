@@ -149,7 +149,7 @@ class Browser:
                     data={"req": req, "api_key": "definitely-wrong", "action": "allow"},
                 )
                 assert r.status_code == 400
-                assert "AXLE rejected this API key" in r.text
+                assert "AXLE rejected" in r.text
             r = await http.post(
                 f"{login_url.split('/login')[0]}/login",
                 data={"req": req, "api_key": self.api_key, "action": "allow"},
@@ -158,7 +158,8 @@ class Browser:
             location = r.headers["location"]
             assert location.startswith(CLIENT_REDIRECT + "?")
             self.callback_query = {
-                k: v[0] for k, v in urllib.parse.parse_qs(urllib.parse.urlsplit(location).query).items()
+                k: v[0]
+                for k, v in urllib.parse.parse_qs(urllib.parse.urlsplit(location).query).items()
             }
 
     async def callback_handler(self) -> tuple[str, str | None]:
@@ -262,7 +263,9 @@ async def test_dcr_flow_end_to_end(stack: tuple[str, MockAxle]) -> None:
         assert r.status_code == 400 and r.json()["error"] == "invalid_grant"
 
 
-async def test_cimd_flow_end_to_end(stack: tuple[str, MockAxle], monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_cimd_flow_end_to_end(
+    stack: tuple[str, MockAxle], monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Client ID Metadata Document: no /register call, client_id is an https URL."""
     mcp_url, _mock = stack
     cimd_url = "https://client.example/oauth/client.json"
@@ -320,7 +323,11 @@ async def test_confidential_dcr_client_manual_flow(stack: tuple[str, MockAxle]) 
         assert reg["client_secret"] and reg["client_secret_expires_at"] == 0
 
         verifier = secrets.token_urlsafe(48)
-        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+        challenge = (
+            base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+            .decode()
+            .rstrip("=")
+        )
         params = {
             "response_type": "code",
             "client_id": reg["client_id"],
@@ -342,7 +349,9 @@ async def test_confidential_dcr_client_manual_flow(stack: tuple[str, MockAxle]) 
         assert q["error"] == ["access_denied"] and q["state"] == ["xyz"]
 
         # Approve.
-        r = await http.post(f"{mcp_url}/login", data={"req": req, "api_key": VALID_KEY, "action": "allow"})
+        r = await http.post(
+            f"{mcp_url}/login", data={"req": req, "api_key": VALID_KEY, "action": "allow"}
+        )
         assert r.status_code == 302, r.text
         q = urllib.parse.parse_qs(urllib.parse.urlsplit(r.headers["location"]).query)
         assert q["state"] == ["xyz"] and q["iss"] == [mcp_url]
@@ -382,7 +391,9 @@ async def test_confidential_dcr_client_manual_flow(stack: tuple[str, MockAxle]) 
         assert r.status_code == 400 and r.json()["error"] == "invalid_grant"
 
         # Unregistered redirect_uri is refused without redirecting anywhere.
-        r = await http.get(f"{mcp_url}/authorize", params={**params, "redirect_uri": "https://evil.test/cb"})
+        r = await http.get(
+            f"{mcp_url}/authorize", params={**params, "redirect_uri": "https://evil.test/cb"}
+        )
         assert r.status_code == 400
 
 
@@ -409,7 +420,9 @@ async def test_raw_api_key_header_end_to_end(stack: tuple[str, MockAxle]) -> Non
         assert "resource_metadata=" in r.headers["www-authenticate"]
 
         r = await http.post(
-            f"{mcp_url}/mcp", headers={**headers, "Authorization": "Bearer not-a-real-key"}, json=init
+            f"{mcp_url}/mcp",
+            headers={**headers, "Authorization": "Bearer not-a-real-key"},
+            json=init,
         )
         assert r.status_code == 401
         assert 'error="invalid_token"' in r.headers["www-authenticate"]
