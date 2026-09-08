@@ -4,20 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "axiom-axle-mcp"
-version = "0.3.8"
+version = "0.4.0"
 description = "MCP server for Axiom Lean Engine (AXLE) — exposes Lean verification tools to Claude Code and other MCP clients"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp>=1.2.0,<2",
+    "mcp>=1.12,<2",
 ]
 
 [project.optional-dependencies]
 http = [
-    "mcp>=1.20.0,<2",
+    "mcp>=1.30,<2",
     "starlette>=0.40",
     "uvicorn>=0.30",
+    "cryptography>=42",
+    "python-multipart>=0.0.9",
 ]
 
 [project.scripts]
@@ -30,6 +32,7 @@ include = ["axle_mcp_server*"]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
+    "httpx>=0.27",
     "mypy>=1.8.0",
     "ruff>=0.14.11,<0.15",
 ]
