@@ -13,10 +13,11 @@ verification and manipulation tools to AI agents.
 
 ### Claude (web, desktop, mobile)
 
-1. Open [Customize → Connectors](https://claude.ai/customize/connectors) → **Add custom connector**.
+1. Open [Customize → Connectors](https://claude.ai/customize/connectors) → **Add** → **Add custom connector**.
 2. Name: `Axle`. Remote MCP server URL: `https://mcp.axiommath.ai/mcp`. Click **Add**.
-3. Click **Connect** and paste your API key on the sign-in page.
-4. In a chat, open the **+** menu → **Connectors** and switch **Axle** on.
+3. Click **Add** again to accept the default client settings.
+4. Click **Connect** and paste your API key on the sign-in page.
+5. In a chat, open the **+** menu → **Connectors** and switch **Axle** on.
 
 ### ChatGPT
 
