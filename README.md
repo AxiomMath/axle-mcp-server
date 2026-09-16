@@ -1,44 +1,66 @@
 # AXLE MCP Server
 
-A [Model Context
-Protocol](https://modelcontextprotocol.io/docs/getting-started/intro) server for
-[Axiom Lean Engine](https://axle.axiommath.ai) — exposes Lean verification and
-manipulation tools to AI agents.
+A [Model Context Protocol](https://modelcontextprotocol.io/docs/getting-started/intro)
+server for [Axiom Lean Engine](https://axle.axiommath.ai) — exposes Lean
+verification and manipulation tools to AI agents.
 
 ![](demo.gif)
 
-
-## Tools
-
-Most tools are generated from the AXLE API's `/v1/endpoints` — `verify_proof`,
-`check`, `merge`, `sorry2lemma` and friends. Alongside them the server provides:
-
-| Tool | Purpose |
-| --- | --- |
-| `read_docs` | Read the AXLE documentation. Call with no arguments for the page index, then `page="verify_proof"` for one page. |
-| `list_environments` | List the available Lean environments. |
-| `share_url` | Turn a prior call's `request_id` into a permanent shareable webapp URL. |
-| `read_share_url` | Read back the inputs and result behind a share URL. |
-
-
 ## Installation
 
-1. Create a free API key:
-   [https://axle.axiommath.ai/app/console](https://axle.axiommath.ai/app/console).
+1. Create a free API key: [https://axle.axiommath.ai/app/console](https://axle.axiommath.ai/app/console).
+2. Connect your client:
 
-2. Add the MCP server to your client using one of the options below.
+### Claude (web, desktop, mobile)
+
+1. Open [Customize → Connectors](https://claude.ai/customize/connectors) → **Add** → **Add custom connector**.
+2. Name: `Axle`. Remote MCP server URL: `https://mcp.axiommath.ai/mcp`. Click **Add**.
+3. Click **Add** again to accept the default client settings.
+4. Click **Connect** and paste your API key on the sign-in page.
+5. In a chat, open the **+** menu → **Connectors** and switch **Axle** on.
+
+### ChatGPT
+
+Needs a paid plan and Developer mode (**Settings → Security and login**).
+
+1. Open [ChatGPT Plugins](https://chatgpt.com/plugins) → **+**.
+2. Name: `Axle`. MCP server URL: `https://mcp.axiommath.ai/mcp`. Authentication: **OAuth**.
+3. Create it and paste your API key on the sign-in page.
+4. In a chat, add Axle from the **+** → **Developer mode** menu.
 
 ### Claude Code
 
-Replace `your_api_key_here` with the API key you created in step 1:
 ```bash
-claude mcp add axle -e AXLE_API_KEY=your_api_key_here -- uvx --from axiom-axle-mcp axle-mcp-server
+claude mcp add --transport http axle https://mcp.axiommath.ai/mcp
 ```
 
-### Other MCP clients (Cursor, Windsurf, Claude Desktop, VS Code, Cline, etc.)
+Then run `/mcp` and paste your API key on the page that opens. To skip the
+browser, pass the key directly:
 
-Add the following to your client's MCP config file. Replace `your_api_key_here`
-with the API key you created in step 1:
+```bash
+claude mcp add --transport http axle https://mcp.axiommath.ai/mcp \
+  --header "Authorization: Bearer your_api_key_here"
+```
+
+### Other MCP clients (Cursor, Windsurf, VS Code, Cline, ...)
+
+```json
+{
+  "mcpServers": {
+    "axle": {
+      "type": "http",
+      "url": "https://mcp.axiommath.ai/mcp",
+      "headers": {
+        "Authorization": "Bearer your_api_key_here"
+      }
+    }
+  }
+}
+```
+
+To run the server locally instead (enables `file_uri`, which reads Lean files
+from disk):
+
 ```json
 {
   "mcpServers": {
@@ -53,18 +75,14 @@ with the API key you created in step 1:
 }
 ```
 
-### Claude (web / desktop / mobile)
+## Tools
 
-A hosted instance runs at `https://mcp.axiommath.ai/mcp`. You only need to do
-this once; after setup, Axle is available in every future conversation.
+Most tools are generated from the AXLE API's `/v1/endpoints` — `verify_proof`,
+`check`, `merge`, `sorry2lemma` and friends. Alongside them the server provides:
 
-1. Open Claude and click your profile avatar → **Settings**.
-2. Go to the **Connectors** tab.
-3. Scroll to the bottom of the page and click **Add custom connector**.
-4. Fill in:
-   - **Name:** `Axle`
-   - **Remote MCP server URL:** `https://mcp.axiommath.ai/mcp`
-5. Click **Add**.
-6. In any chat, open the tools menu (the **+** or paperclip icon in the
-   composer) → **Connectors** → toggle **Axle** on. You should see the Axle
-   tools listed.
+| Tool | Purpose |
+| --- | --- |
+| `read_docs` | Read the AXLE documentation. Call with no arguments for the page index, then `page="verify_proof"` for one page. |
+| `list_environments` | List the available Lean environments. |
+| `share_url` | Turn a prior call's `request_id` into a permanent shareable webapp URL. |
+| `read_share_url` | Read back the inputs and result behind a share URL. |
