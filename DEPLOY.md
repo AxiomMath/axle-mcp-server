@@ -20,3 +20,17 @@ curl -si -X POST https://mcp.axiommath.ai/mcp | head -5   # 401 with WWW-Authent
 `AXLE_MCP_TOKEN_SECRET` (Secret Manager) encrypts the sign-in tokens; rotating
 it signs every user out. Add `AXLE_MCP_ALLOW_ANONYMOUS=1` to `--set-env-vars`
 to also serve requests with no credentials, as the server did before 0.4.0.
+
+## Publishing to PyPI
+
+The `uvx --from axiom-axle-mcp` setups in the README install from PyPI, so publish
+after bumping `version` in `pyproject.toml`:
+
+```bash
+rm -rf dist && uv build
+UV_PUBLISH_TOKEN=pypi-... uv publish
+```
+
+The token is a PyPI API token scoped to the `axiom-axle-mcp` project
+(pypi.org → Account settings → API tokens). Check with
+`uvx --from axiom-axle-mcp==<version> axle-mcp-server --help`.
